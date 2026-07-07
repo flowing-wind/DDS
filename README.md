@@ -25,6 +25,9 @@ Designed to live on an in-FPGA APB fabric next to other small IP cores
 - 16-bit phase offset (≈ 0.0055° resolution)
 - Digital amplitude scaling 0 … 1.0 (Q1.16 multiplier; peak voltage is set in
   the external DAC/filter chain)
+- Programmable DC offset: 14-bit signed, saturating, added after the
+  amplitude scaler — waveform + bias, or a pure DC level output
+
 - Output conditioning: 14-bit or 12-bit (MSB-aligned, rounded), offset-binary
   or two's-complement coding, polarity invert, mid-scale idle when disabled
 - All parameters double-buffered and applied **atomically and
@@ -45,12 +48,13 @@ rtl/
   dds_wave_ram.v   user waveform dual-port RAM (inferred BRAM)
   dds_cdc.v        clock-domain-crossing helpers
 tb/
-  tb_dds.v         self-checking testbench (Icarus Verilog)
+  tb_dds.sv         self-checking testbench (Icarus Verilog)
 scripts/
   gen_sin_lut.py   regenerates dds_sin_lut.mem
 Doc/
   DDS_Datasheet.md full datasheet: register map, programming examples,
                    integration and constraints
+  AN01_AD9764_Module.md  application note for one specific target DAC board
   dds.pdf          theory reference (ADI DDS tutorial) the design follows
 ```
 
@@ -88,8 +92,8 @@ Requires Icarus Verilog:
 
 ```
 cd tb
-iverilog -g2001 -o tb_dds.vvp tb_dds.v ../rtl/*.v
-vvp tb_dds.vvp        # 21 self-checks -> "ALL TESTS PASSED"
+iverilog -g2012 -o tb_dds.vvp tb_dds.sv ../rtl/*.v
+vvp tb_dds.vvp        # 26 self-checks -> "ALL TESTS PASSED"
 ```
 
 Add `-DASYNC_CLKS` to rerun the same suite with a 125 MHz `dds_clk`

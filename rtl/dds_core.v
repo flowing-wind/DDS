@@ -5,7 +5,7 @@
 //     -> 32-bit phase accumulator (+ phase offset word)
 //     -> waveform generation (1/4-wave sine LUT, square, triangle,
 //        ramp, user RAM)
-//     -> amplitude multiplier (Q1.16, 0..1.0)
+//     -> amplitude multiplier (Q1.16, 0..1.0) + DC offset (saturating)
 //     -> output conditioning (14/12-bit, offset-binary / two's complement)
 //
 // Output pipeline latency: 6 dds_clk cycles from phase accumulator to
@@ -23,6 +23,7 @@ module dds_core #(
     input  wire [15:0] t_pow,
     input  wire [16:0] t_amp,
     input  wire [15:0] t_duty,
+    input  wire [13:0] t_offset,
     input  wire [2:0]  t_wave_sel,
     input  wire [1:0]  t_freq_mode,
     input  wire        t_out_width,
@@ -111,6 +112,7 @@ reg [31:0] a_fword, a_fstart, a_fdelta;
 reg [31:0] a_limit;                       // fstop - fstart
 reg [15:0] a_pow, a_duty;
 reg [16:0] a_amp;
+reg signed [13:0] a_offset;
 reg [2:0]  a_wave;
 reg [1:0]  a_mode, a_swmode, a_psel;
 reg        a_ext_trig, a_ext_psel;
@@ -123,7 +125,8 @@ always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) begin
         a_fword <= 32'h0;   a_fstart <= 32'h0;  a_fdelta <= 32'h0;
         a_limit <= 32'h0;   a_pow <= 16'h0;     a_duty <= 16'h8000;
-        a_amp <= 17'h10000; a_wave <= W_SIN;    a_mode <= M_FIXED;
+        a_amp <= 17'h10000; a_offset <= 14'sd0;
+        a_wave <= W_SIN;    a_mode <= M_FIXED;
         a_swmode <= SW_SINGLE; a_psel <= 2'd0;
         a_ext_trig <= 1'b0; a_ext_psel <= 1'b0; a_rate <= 24'd1;
         a_width12 <= 1'b0;  a_fmt2c <= 1'b0;    a_inv <= 1'b0;
@@ -140,6 +143,7 @@ always @(posedge dds_clk or negedge dds_rstn) begin
         a_pow      <= t_pow;
         a_duty     <= t_duty;
         a_amp      <= t_amp[16] ? 17'h10000 : t_amp;
+        a_offset   <= $signed(t_offset);
         a_wave     <= t_wave_sel;
         a_mode     <= t_freq_mode;
         a_swmode   <= t_sweep_mode;
@@ -329,15 +333,17 @@ always @(posedge dds_clk or negedge dds_rstn) begin
     else if (en_s)  prod4 <= smp3 * $signed({1'b0, a_amp});
 end
 
-// s5: round to nearest, saturate to 14-bit signed
+// s5: round to nearest, add DC offset, saturate to 14-bit signed.
+// Worst case |rnd5 + offset| = 8192 + 8192 fits in 16-bit signed.
 wire signed [15:0] rnd5 = (prod4 + 32'sd32768) >>> 16;
+wire signed [15:0] ofs5 = rnd5 + a_offset;
 reg  signed [13:0] samp5;
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) samp5 <= 14'sd0;
     else if (en_s) begin
-        if      (rnd5 >  16'sd8191) samp5 <=  14'sd8191;
-        else if (rnd5 < -16'sd8192) samp5 <= -14'sd8192;
-        else                        samp5 <= rnd5[13:0];
+        if      (ofs5 >  16'sd8191) samp5 <=  14'sd8191;
+        else if (ofs5 < -16'sd8192) samp5 <= -14'sd8192;
+        else                        samp5 <= ofs5[13:0];
     end
 end
 

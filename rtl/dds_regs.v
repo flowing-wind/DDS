@@ -29,6 +29,7 @@ module dds_regs (
     output reg  [15:0] t_pow,
     output reg  [16:0] t_amp,
     output reg  [15:0] t_duty,
+    output reg  [13:0] t_offset,
     output reg  [2:0]  t_wave_sel,
     output reg  [1:0]  t_freq_mode,
     output reg         t_out_width,
@@ -76,7 +77,7 @@ module dds_regs (
     output wire        dds_irq
 );
 
-localparam VERSION = 32'h4453_0100;   // "DS" + v1.0.0
+localparam VERSION = 32'h4453_0110;   // "DS" + v1.1.0
 
 // word index of each register (byte offset / 4)
 localparam A_ID           = 6'd0,   // 0x00
@@ -100,7 +101,8 @@ localparam A_ID           = 6'd0,   // 0x00
            A_PROF_POW10   = 6'd18,  // 0x48
            A_PROF_POW32   = 6'd19,  // 0x4C
            A_IRQ_EN       = 6'd20,  // 0x50
-           A_IRQ_STAT     = 6'd21;  // 0x54
+           A_IRQ_STAT     = 6'd21,  // 0x54
+           A_OFFSET       = 6'd22;  // 0x58
 
 // APB Signals
 wire        APB_access   = PSEL && PENABLE;
@@ -119,6 +121,7 @@ reg  [31:0] reg_fword;
 reg  [15:0] reg_pow;
 reg  [16:0] reg_amp;
 reg  [15:0] reg_duty;
+reg  [13:0] reg_offset;
 reg         reg_auto;
 reg  [1:0]  reg_sweep_mode;
 reg         reg_sweep_ext_trig;
@@ -136,7 +139,7 @@ assign cfg_en = reg_en;
 // a write to any register whose content travels through the t_* capture
 wire cfg_write = APB_write_en && !ram_sel &&
                  ((widx == A_CTRL)  || (widx == A_FWORD) || (widx == A_POW)  ||
-                  (widx == A_AMP)   || (widx == A_DUTY)  ||
+                  (widx == A_AMP)   || (widx == A_DUTY)  || (widx == A_OFFSET) ||
                   ((widx >= A_SWEEP_CTRL) && (widx <= A_PROF_POW32)));
 
 wire upd_write   = APB_write_en && !ram_sel && (widx == A_UPDATE) && PWDATA[0];
@@ -157,6 +160,7 @@ always @(posedge PCLK or negedge PRESETn) begin
         reg_pow            <= 16'h0;
         reg_amp            <= 17'h10000;    // 1.0
         reg_duty           <= 16'h8000;     // 50%
+        reg_offset         <= 14'h0;
         reg_auto           <= 1'b1;
         reg_sweep_mode     <= 2'd0;
         reg_sweep_ext_trig <= 1'b0;
@@ -190,6 +194,7 @@ always @(posedge PCLK or negedge PRESETn) begin
                 A_POW:          reg_pow   <= PWDATA[15:0];
                 A_AMP:          reg_amp   <= PWDATA[16] ? 17'h10000 : PWDATA[16:0];
                 A_DUTY:         reg_duty  <= PWDATA[15:0];
+                A_OFFSET:       reg_offset <= PWDATA[13:0];
                 A_UPDATE:       reg_auto  <= PWDATA[1];
                 A_SWEEP_CTRL: begin
                     reg_sweep_mode     <= PWDATA[1:0];
@@ -240,6 +245,7 @@ always @(posedge PCLK or negedge PRESETn) begin
         xfer_tgl <= 1'b0;
         t_fword <= 32'h0;         t_pow  <= 16'h0;
         t_amp   <= 17'h10000;     t_duty <= 16'h8000;
+        t_offset <= 14'h0;
         t_wave_sel <= 3'd0;       t_freq_mode <= 2'd0;
         t_out_width <= 1'b0;      t_out_fmt <= 1'b0;      t_out_inv <= 1'b0;
         t_sweep_mode <= 2'd0;     t_sweep_ext_trig <= 1'b0;
@@ -276,6 +282,7 @@ always @(posedge PCLK or negedge PRESETn) begin
             t_pow            <= reg_pow;
             t_amp            <= reg_amp;
             t_duty           <= reg_duty;
+            t_offset         <= reg_offset;
             t_wave_sel       <= reg_wave_sel;
             t_freq_mode      <= reg_freq_mode;
             t_out_width      <= reg_out_width;
@@ -394,6 +401,7 @@ always @(*) begin
                 A_PROF_POW32:   PRDATA = {reg_prof_pow[3], reg_prof_pow[2]};
                 A_IRQ_EN:       PRDATA = {29'h0, reg_irq_en};
                 A_IRQ_STAT:     PRDATA = {29'h0, reg_irq_stat};
+                A_OFFSET:       PRDATA = {18'h0, reg_offset};
                 default:        PRDATA = 32'h0;
             endcase
         end

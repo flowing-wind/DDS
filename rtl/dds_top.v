@@ -43,6 +43,7 @@ wire [31:0] t_fword, t_sweep_fstart, t_sweep_fstop, t_sweep_fdelta;
 wire [31:0] t_prof_fword0, t_prof_fword1, t_prof_fword2, t_prof_fword3;
 wire [16:0] t_amp;
 wire [15:0] t_pow, t_duty;
+wire [13:0] t_offset;
 wire [15:0] t_prof_pow0, t_prof_pow1, t_prof_pow2, t_prof_pow3;
 wire [23:0] t_sweep_rate;
 wire [2:0]  t_wave_sel;
@@ -77,6 +78,7 @@ dds_regs u_regs (
     .t_pow             (t_pow),
     .t_amp             (t_amp),
     .t_duty            (t_duty),
+    .t_offset          (t_offset),
     .t_wave_sel        (t_wave_sel),
     .t_freq_mode       (t_freq_mode),
     .t_out_width       (t_out_width),
@@ -131,6 +133,7 @@ dds_core #(
     .t_pow             (t_pow),
     .t_amp             (t_amp),
     .t_duty            (t_duty),
+    .t_offset          (t_offset),
     .t_wave_sel        (t_wave_sel),
     .t_freq_mode       (t_freq_mode),
     .t_out_width       (t_out_width),

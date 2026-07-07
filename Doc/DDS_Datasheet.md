@@ -1,6 +1,6 @@
 # DDS_TOP — Direct Digital Synthesizer IP Core with APB Interface
 
-**Datasheet, Rev 1.0 — 2026-07-07**
+**Datasheet, Rev 1.1 — 2026-07-07**
 
 | | |
 |---|---|
@@ -8,7 +8,7 @@
 | Bus interface    | APB (32-bit data, style-compatible with `spi_regs.v`) |
 | Output           | 12/14-bit parallel DAC data |
 | HDL              | Verilog-2001 |
-| Verification     | Self-checking testbench ([tb/tb_dds.v](../tb/tb_dds.v)), Icarus Verilog; passes with PCLK = dds_clk and with fully asynchronous clocks |
+| Verification     | Self-checking testbench ([tb/tb_dds.sv](../tb/tb_dds.sv)), Icarus Verilog; passes with PCLK = dds_clk and with fully asynchronous clocks |
 | Theory reference | *A Technical Tutorial on Digital Signal Synthesis*, Analog Devices 1999 (`Doc/dds.pdf`) |
 
 ---
@@ -27,6 +27,8 @@
 - **Phase offset**: 16-bit, resolution 360°/65536 ≈ 0.0055°.
 - **Digital amplitude scaling** 0 … 1.0 (Q1.16 multiplier ahead of the output
   stage). The absolute peak voltage is set externally in the DAC/filter chain.
+- **Programmable DC offset**: 14-bit signed, added after the amplitude
+  multiplier with saturation — waveform + bias, or a pure DC level (AMP = 0).
 - Three frequency-control modes:
   - **FIXED** — one tuning word, glitch-free (phase-continuous) retuning.
   - **SWEEP** — linear/piecewise-linear chirp between two frequencies
@@ -75,6 +77,7 @@
                                        │   │   └─ WAVE RAM port B (4096×14)
                                        │   │            v  14-bit signed
                                        │   │      × AMP (Q1.16, 0…1.0)
+                                       │   │      + OFFSET (14-bit signed)
                                        │   │            v  round + saturate
                                        │   │      output stage: 14/12-bit,
                                        │   │      offset-bin / 2's comp, INV
@@ -118,9 +121,11 @@ peaks at ±8191.
 
 ### 2.3 Amplitude path
 
-`sample(14-bit signed) × AMP(Q1.16)`, rounded to nearest and saturated to
-14 bits (Doc/dds.pdf, Fig. 11.4). AMP = 0x10000 is exactly 1.0 and is a true
-identity (bit-exact pass-through). One DSP48 implements the multiply.
+`sample(14-bit signed) × AMP(Q1.16) + OFFSET`, rounded to nearest and
+saturated to 14 bits (Doc/dds.pdf, Fig. 11.4). AMP = 0x10000 with OFFSET = 0
+is exactly 1.0 and a true identity (bit-exact pass-through). The OFFSET add
+shares the rounding stage, so it costs no extra latency. One DSP48
+implements the multiply.
 
 ### 2.4 Pipeline latency
 
@@ -184,7 +189,7 @@ Reserved bits read 0 and must be written 0. **W1SC** = write-1, self-clearing
 
 | Offset | Name | Access | Reset | Function |
 |---|---|---|---|---|
-| 0x00 | ID           | RO  | 0x4453_0100 | "DS" + version 1.0.0 |
+| 0x00 | ID           | RO  | 0x4453_0110 | "DS" + version 1.1.0 |
 | 0x04 | CTRL         | RW  | 0x0000_0000 | Enable, waveform, frequency mode, output format |
 | 0x08 | STATUS       | RO  | 0x0000_0000 | Sweep/profile/update status |
 | 0x0C | FWORD        | RW  | 0x0000_0000 | Frequency tuning word (FIXED mode) |
@@ -206,6 +211,7 @@ Reserved bits read 0 and must be written 0. **W1SC** = write-1, self-clearing
 | 0x4C | PROF_POW32   | RW  | 0x0000_0000 | [15:0] profile 2 phase, [31:16] profile 3 phase |
 | 0x50 | IRQ_EN       | RW  | 0x0000_0000 | Interrupt enables |
 | 0x54 | IRQ_STAT     | W1C | 0x0000_0000 | Interrupt flags |
+| 0x58 | OFFSET       | RW  | 0x0000_0000 | DC offset, 14-bit signed |
 | 0x4000–0x7FFC | WAVE_RAM | RW | undefined | 4096 × 32-bit words; sample in [13:0]. Entry n at 0x4000 + 4n |
 
 ### 5.1 CTRL (0x04)
@@ -305,7 +311,13 @@ Identical layout. A flag sets regardless of the enable; the enable only gates
 | 1 | SWEEP_WRAP | Repeating sweep wrapped / up-down sweep reversed. |
 | 2 | UPD_DONE   | A configuration transfer was applied in the dds_clk domain. |
 
-### 5.12 WAVE_RAM (0x4000–0x7FFC)
+### 5.12 OFFSET (0x58)
+
+| Bits | Field | Description |
+|---|---|---|
+| 13:0 | OFFSET | DC offset, 14-bit two's complement (−8192 … +8191), same LSB weight as the output sample. Added **after** the amplitude multiplier with saturation to ±full-scale, so |waveform amplitude| + |offset| beyond full scale clips cleanly. OUT_INV inverts the waveform only, not the offset. With AMP = 0 the output is a pure programmable DC level. In 12-bit mode the offset is applied before the 14→12 rounding (LSB weight stays 1/8192 of full scale). |
+
+### 5.13 WAVE_RAM (0x4000–0x7FFC)
 
 4096 words; bits [13:0] hold one two's-complement sample at DAC full scale
 (−8192…+8191); bits [31:14] are ignored and read 0. Playback address is
@@ -367,8 +379,9 @@ cycles). 2-FSK uses profiles 0/1 on `hop_sel[0]`; 4-FSK/QPSK uses all four.
 
 ### 6.3 Output stage and DAC connection
 
-Processing order: waveform sample → INV → × AMP → round/saturate →
-12-bit rounding (if OUT_WIDTH) → coding (OUT_FMT) → register → `dac_data`.
+Processing order: waveform sample → INV → × AMP → round → + OFFSET →
+saturate → 12-bit rounding (if OUT_WIDTH) → coding (OUT_FMT) → register →
+`dac_data`.
 
 - **14-bit DAC:** connect `dac_data[13:0]` directly.
 - **12-bit DAC:** set OUT_WIDTH = 1, connect the DAC to `dac_data[13:2]`.
@@ -439,6 +452,17 @@ write 0x18, 0x00004CCD     // DUTY  = 0.30 × 65536
 write 0x04, 0x00001021     // CTRL: EN, square, 12-bit, offset binary
 ```
 
+### 7.4b Sine riding on a DC bias / pure DC level
+
+```
+write 0x14, 0x00008000     // AMP    = 0.5 (leave headroom for the bias)
+write 0x58, 0x00000800     // OFFSET = +2048 (+25 % of full scale)
+                           // -> sine swings -25 % … +75 % of full scale
+
+write 0x14, 0x00000000     // AMP = 0:
+write 0x58, 0x000003E8     // output is a constant DC level of +1000 LSB
+```
+
 ### 7.5 Hardware-timed sweep: 100 kHz → 1 MHz in 10 ms, repeating
 
 ```
@@ -503,7 +527,8 @@ write 0x0C, new_fword      // AUTO update
 | `rtl/dds_sin_lut.mem`| ROM init data (regenerate: `scripts/gen_sin_lut.py`) |
 | `rtl/dds_wave_ram.v` | User waveform dual-port RAM |
 | `rtl/dds_cdc.v`      | Toggle-pulse and 2-FF synchronizers |
-| `tb/tb_dds.v`        | Self-checking testbench |
+| `tb/tb_dds.sv`        | Self-checking testbench |
+| `Doc/AN01_AD9764_Module.md` | Application note for a specific DAC board (board-level topics are kept out of this datasheet) |
 
 Add `dds_sin_lut.mem` to the Vivado project (as a design source or in the
 simulation/synthesis search path), or set the `SIN_LUT_FILE` parameter to an
@@ -543,9 +568,9 @@ the 32-bit adds, all single-level).
 
 ```
 cd tb
-iverilog -g2001 -o tb_dds.vvp tb_dds.v ../rtl/*.v
-vvp tb_dds.vvp                          # 21 checks, "ALL TESTS PASSED"
-iverilog -g2001 -DASYNC_CLKS ...        # same suite with 125 MHz async dds_clk
+iverilog -g2012 -o tb_dds.vvp tb_dds.sv ../rtl/*.v
+vvp tb_dds.vvp                          # 26 checks, "ALL TESTS PASSED"
+iverilog -g2012 -DASYNC_CLKS ...        # same suite with 125 MHz async dds_clk
 ```
 
 A VCD (`tb_dds.vcd`) is dumped for waveform inspection.
@@ -559,11 +584,12 @@ A VCD (`tb_dds.vcd`) is dumped for waveform inspection.
 - WAVE_RAM is uninitialized at power-up.
 - ACTIVE_PROF in STATUS may momentarily tear during a hop (read-only,
   informational).
-- Exactly 100 % square duty is unreachable (65535/65536 max); use AMP = 0 +
-  OUT_INV or a profile trick if a DC level is ever needed.
+- Exactly 100 % square duty is unreachable (65535/65536 max); for a static
+  level use AMP = 0 with the OFFSET register instead.
 
 ## 10. Revision history
 
 | Rev | Date | Notes |
 |---|---|---|
 | 1.0 | 2026-07-07 | Initial release. Verified with Icarus Verilog, sync and async clock configurations. |
+| 1.1 | 2026-07-07 | Added OFFSET register (0x58): 14-bit signed DC offset with saturation, applied after the amplitude multiplier. ID reads 0x4453_0110. Testbench rewritten in SystemVerilog, 26 checks. |
