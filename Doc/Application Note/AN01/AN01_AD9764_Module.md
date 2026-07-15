@@ -24,7 +24,7 @@ Key facts that drive the integration choices below:
 
 | Property | Value | Consequence |
 |---|---|---|
-| Channels | 2, fully independent (U3/U6), each with own D[13:0] + CLK on the 34-pin header | Two `dds_top` instances for dual output |
+| Channels | 2, fully independent (U3/U6), each with own D[13:0] + CLK on the 34-pin header | One `dds_top` with `NUM_CH = 2` drives both |
 | Input coding | Straight (natural) binary: code 0 = −FS, 8192 = 0 V, 16383 = +FS | Use **CTRL.OUT_FMT = 0** (offset binary, the reset default) |
 | Logic level | 3.3 V | Match the FPGA bank voltage |
 | Output range | −3 V … +3 V, max ≈ 6 Vpp, **DC-coupled end to end** | DC offsets pass through; the OFFSET register works as a true bias |
@@ -37,16 +37,19 @@ Key facts that drive the integration choices below:
 
 | DDS_TOP signal | Module pin | Note |
 |---|---|---|
-| `dac_data[13:0]` | DB13 (MSB) … DB0 (LSB) | Direct, one channel |
+| `ch0_dac_data[13:0]` | U3: DB13 (MSB) … DB0 (LSB) | Channel 0 |
+| `ch1_dac_data[13:0]` | U6: DB13 (MSB) … DB0 (LSB) | Channel 1 |
 | `dds_clk` (forwarded, see §4) | CLKA / CLKB | One clock per channel |
 | — | SLEEP, REFLO, FS ADJ | Handled on-board, not on the header |
 
-Required register settings for this module:
+Required register settings for this module (per channel):
 
 ```
-CTRL.OUT_FMT   = 0   // straight binary (reset default — do NOT set two's complement)
-CTRL.OUT_WIDTH = 0   // 14-bit mode, full bus connected
+CTRL.FMT_2C = 0   // offset binary (reset default — do NOT set two's complement)
+CTRL.OUT12  = 0   // 14-bit mode, full bus connected
 ```
+
+From the STM32 command line that is `fmt ob` and `width 14`.
 
 With EN = 0 the core drives mid-scale 0x2000, which this module converts to
 0 V — the correct idle level.
@@ -72,10 +75,12 @@ The on-board reconstruction filter is designed for a 100 MHz DAC clock
   through and the waveform visibly jitters. The module manual reports
   exactly this above 20 MHz even at full clock.
 
-Recommended PLL plan from the 50 MHz oscillator: 100 MHz → `dds_clk` (and
-DAC CLK), 50 MHz → `PCLK`. The core's internal CDC supports this directly;
-apply the two XDC constraints from datasheet §8.2. Remember FWORD values
-scale with f_dds: at 100 MHz, 1 MHz → FWORD = 0x028F5C29.
+Recommended PLL plan from the 50 MHz oscillator: 100 MHz → `dds_clk`, which is
+the core's only clock (and the DAC CLK). The SPI pins are oversampled in that
+domain, so there is no second clock and no CDC to constrain — just the false
+paths from datasheet §8.3. Remember FWORD values scale with f_dds: at 100 MHz,
+1 MHz → FWORD = 0x028F5C29, and `DDS_CLK_HZ` in the STM32 firmware's `dds.h`
+must say 100000000 as well.
 
 ## 4. Data-to-clock timing at the DAC
 
@@ -184,24 +189,39 @@ Redo it if the potentiometer or external reference changes.
 
 ## 9. Dual-channel use
 
-The module carries two independent AD9764s. Instantiate two `dds_top` cores
-(each takes a 32 KB address window) sharing `dds_clk`, with separate
-`dac_data`/CLK wiring per channel. For a phase-locked I/Q pair (one sine,
-one cosine at the same FWORD): the two cores' phase accumulators start from
-the same reset, but separate APB SRST writes land a few cycles apart, giving
-a fixed, calculable phase difference of `FWORD × Δt`. Either compensate it
-with one core's POW register after measuring, or hold both cores in EN = 0,
-configure identically, then enable — the accumulators were both cleared by
-the common `dds_rstn`, so they leave reset phase-aligned as long as neither
-was enabled in between.
+The module carries two independent AD9764s, which is exactly what `dds_top`
+with `NUM_CH = 2` drives: one SPI port, one chip select, both channels selected
+by CMD[14], with separate `chN_dac_data`/CLK wiring per DAC.
+
+**Phase relationship between the channels.** Nothing in the SPI path is
+sample-exact across channels: the two frames that enable ch0 and ch1 commit a
+few microseconds apart, so the second accumulator starts N samples late and the
+outputs sit `Δφ = N × FWORD` apart. That offset is *constant* — both
+accumulators run from the same `dds_clk` at the same FWORD, so it never drifts —
+but it is not zero, and it scales with FWORD.
+
+For a phase-locked I/Q pair you therefore have two honest options:
+
+- **Null it with POW.** Enable both channels once, measure Δφ on a scope at your
+  operating frequency, and write the correction into one channel's POW register
+  (use `WAVE = cosine` on that channel for the 90°). Recompute POW if you
+  retune, since Δφ scales with FWORD.
+- **Sync in the fabric.** If you need a sample-exact, frequency-independent
+  pair, add one signal to your wrapper: register a "sync" bit and use it to hold
+  both channels' `dds_rstn` (or gate both `CTRL.EN`s) so the two accumulators
+  leave reset on the same clock edge. This is a few lines of glue and removes
+  the problem entirely.
 
 ## 10. Bring-up checklist
 
 1. Power the module from a clean 5 V rail; verify −5 V and 3.3 V rails.
 2. Jumpers J3/J5 fitted (internal reference) for first light.
-3. `PCLK` = 50 MHz, `dds_clk` = 100 MHz, ODDR-inverted clock to CLKA.
-4. Write FWORD = 0x028F5C29 (1 MHz @ 100 MHz), CTRL = 0x0000_0001
-   (EN, sine, 14-bit, offset binary — all other fields default).
-5. Expect ≈ 6 Vpp sine on a 1 MΩ scope input (≈ 3 Vpp into 50 Ω).
-6. Then exercise AMP, OFFSET, DUTY and the sweep — all pure register writes,
+3. `dds_clk` = 100 MHz (the core's only clock), ODDR-inverted clock to CLKA.
+4. Check the SPI link first: `id` on the STM32 console must print
+   `ID 0x4453 VERSION 0x0200` for both channels. If not, stop here — the DAC
+   cannot be right if the register bus is not.
+5. `freq 1M`, `wave sine`, `fmt ob`, `on` (or write FWORD = 0x028F5C29 and
+   CTRL = 0x0001 directly: EN, sine, 14-bit, offset binary).
+6. Expect ≈ 6 Vpp sine on a 1 MΩ scope input (≈ 3 Vpp into 50 Ω).
+7. Then exercise `amp`, `offset`, `duty` and `sweep` — all pure register writes,
    examples in datasheet §7.

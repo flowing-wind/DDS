@@ -1,94 +1,96 @@
-# DDS_TOP — Direct Digital Synthesizer IP Core with APB Interface
+# DDS_TOP — Direct Digital Synthesizer IP Core with SPI Interface
 
-**Datasheet, Rev 1.1 — 2026-07-07**
+A Verilog-2001 DDS IP core for FPGA: **one 16-bit SPI slave port** (mode 0)
+configuring **one or two independent channels**, each driving a **14-bit
+parallel DAC**. No vendor IP, no `.coe` files; all memories are inferred BRAM.
+
+Companion firmware: `MCU/STM32F1` (STM32F103 master + UART command line).
 
 | | |
 |---|---|
-| Top-level module | `dds_top` ([rtl/dds_top.v](../rtl/dds_top.v)) |
-| Bus interface    | APB (32-bit data, style-compatible with `spi_regs.v`) |
-| Output           | 12/14-bit parallel DAC data |
-| HDL              | Verilog-2001 |
-| Verification     | Self-checking testbench ([tb/tb_dds.sv](../tb/tb_dds.sv)), Icarus Verilog; passes with PCLK = dds_clk and with fully asynchronous clocks |
-| Theory reference | *A Technical Tutorial on Digital Signal Synthesis*, Analog Devices 1999 (`Doc/dds.pdf`) |
+| Version | 2.0 (`ID` = 0x4453, `VERSION` = 0x0200) |
+| Bus | SPI slave, mode 0 (CPOL=0, CPHA=0), 16-bit words, MSB first |
+| Channels | 1 or 2 (`NUM_CH`), selected by a bit in the command word — one chip select for both |
+| Clock | Single domain: `dds_clk` (100 MHz recommended). SPI pins are oversampled. |
+| DAC | 14-bit (or 12-bit MSB-aligned), offset binary or two's complement |
+| Frequency | 32-bit tuning word, 23.3 mHz resolution at 100 MHz |
+| Waveforms | sine, cosine, square (programmable duty), triangle, ramp, user RAM (4096 × 14) |
+| Modes | fixed, hardware linear sweep/chirp, 4-profile frequency+phase hopping |
 
 ---
 
 ## 1. Features
 
-- 32-bit phase accumulator; output frequency `fout = FWORD × f_dds / 2^32`,
-  tuning resolution `f_dds / 2^32` (11.6 mHz at f_dds = 50 MHz).
-- Six waveforms: **sine**, **cosine**, **square** (programmable duty cycle,
-  16-bit resolution), **triangle**, **ramp** (sawtooth), **user-defined**
-  (4096-point × 14-bit RAM, loaded and read back over APB).
-- Sine/cosine from a 4096-point quarter-wave LUT (16384 effective points per
-  period, 14-bit phase index). Worst-case phase-truncation spur ≈ −84 dBc —
-  at/below the quantization floor of a 14-bit DAC, so no dithering or Taylor
-  correction is needed at this output resolution.
-- **Phase offset**: 16-bit, resolution 360°/65536 ≈ 0.0055°.
-- **Digital amplitude scaling** 0 … 1.0 (Q1.16 multiplier ahead of the output
-  stage). The absolute peak voltage is set externally in the DAC/filter chain.
-- **Programmable DC offset**: 14-bit signed, added after the amplitude
-  multiplier with saturation — waveform + bias, or a pure DC level (AMP = 0).
-- Three frequency-control modes:
-  - **FIXED** — one tuning word, glitch-free (phase-continuous) retuning.
-  - **SWEEP** — linear/piecewise-linear chirp between two frequencies
-    (frequency accumulator + ramp timing logic); single, repeating-sawtooth,
-    or up/down modes; software or hardware trigger.
-  - **PROFILE** — 4 pre-programmed frequency + phase profiles, selected by
-    register or by external pins (direct FSK/PSK from another IP block).
-- Atomic, glitch-free parameter updates: all settings are double-buffered and
-  transferred to the sample-clock domain in a single cycle (manual or
-  automatic update).
-- Output conditioning: 14-bit or 12-bit (MSB-aligned), offset-binary or
-  two's-complement coding, polarity invert, mid-scale idle when disabled.
-- Interrupt output (sweep done / sweep wrap / update done) and hardware
-  pacing inputs (`sweep_trig`, `hop_sel[1:0]`) for interaction with other
-  IP (SPI, user logic) without CPU involvement.
-- Two clock domains with internal CDC: APB `PCLK` and sample clock `dds_clk`
-  may be the same PLL output or fully asynchronous.
+- **32-bit frequency tuning word** — `fout = FWORD × f_dds / 2^32`
+  (23.3 mHz resolution at 100 MHz)
+- **Waveforms**: sine / cosine from a 4096-point quarter-wave LUT (16384
+  effective points per period), square with 16-bit programmable duty cycle,
+  triangle, ramp, and a user-defined 4096 × 14-bit waveform RAM loaded over SPI
+- **Frequency control modes**
+  - **FIXED** — phase-continuous retune on a single frame
+  - **SWEEP** — hardware linear chirp (start/stop/delta/rate), single,
+    repeating, or up/down; software or external-pin trigger
+  - **PROFILE** — 4 pre-programmed frequency+phase profiles, hopped by register
+    or by the `hop_sel[1:0]` input pins (FSK/PSK with zero CPU load)
+- **16-bit phase offset** (≈ 0.0055° resolution)
+- **Digital amplitude scaling** 0 … 1.0 (Q1.15 multiplier)
+- **Programmable DC offset**: 14-bit signed, saturating, added after the
+  amplitude scaler — waveform + bias, or a pure DC level output
+- **Output conditioning**: 14-bit or 12-bit (MSB-aligned, rounded), offset
+  binary or two's complement, polarity invert, mid-scale idle when disabled
+- **Atomic frame commit** — every parameter a frame writes takes effect
+  together, on the rising edge of chip select. A 32-bit frequency word written
+  as two 16-bit halves never puts an intermediate frequency on the DAC.
+- **Single clock domain** — no CDC to constrain, no second bus clock
+- Interrupt output per channel (sweep done / wrap, update done)
 
 ---
 
 ## 2. Block Diagram and Theory of Operation
 
 ```
-            PCLK domain                │              dds_clk domain
-                                       │
- APB ──> shadow registers ──capture──> │ ──sync──> active registers
-  │            │            (t_* set,  │            (loaded atomically)
-  │            │             UPDATE)   │
-  │            └── STATUS/IRQ <──sync─ │ ── events (done/wrap/update)
-  │                                    │
-  └──> WAVE RAM port A (write/read)    │        ┌────────────────────┐
-                                       │        │ frequency source    │
-                                       │        │  FIXED : FWORD      │
-                                       │        │  SWEEP : FSTART +   │
-                                       │        │   freq-accumulator  │
-                                       │        │  PROF  : PROFn      │
-                                       │        └───────┬────────────┘
-                                       │                v
-                                       │   ┌── 32-bit phase accumulator
-                                       │   │        + (POW << 16)
-                                       │   │            v
-                                       │   │   ┌─ ¼-wave sine LUT (4096×13)
-                                       │   │   ├─ square (phase < DUTY)
-                                       │   │   ├─ triangle (folded phase)
-                                       │   │   ├─ ramp (phase MSBs)
-                                       │   │   └─ WAVE RAM port B (4096×14)
-                                       │   │            v  14-bit signed
-                                       │   │      × AMP (Q1.16, 0…1.0)
-                                       │   │      + OFFSET (14-bit signed)
-                                       │   │            v  round + saturate
-                                       │   │      output stage: 14/12-bit,
-                                       │   │      offset-bin / 2's comp, INV
-                                       │   │            v
-                                       │   └──> dac_data[13:0], dac_valid
+  SPI pins                    dds_clk domain (everything)
+ ─────────────────────────────────────────────────────────────────────
+  SCK  ─┐
+  CS_N ─┼─> oversample ─> dds_spi_slave ─> internal bus ─┬─> channel 0
+  MOSI ─┘   (2-FF sync)   CMD: RW|CH|ADDR                └─> channel 1
+  MISO <────────────────  addr auto-increment                  │
+                          CS rise = frame_end (commit)         │
+                                                               v
+   ┌───────────────────────────────────────────────────────────────┐
+   │  shadow registers ──commit on frame_end──> active registers   │
+   │                                                    │          │
+   │                  ┌─────────────────────────────────┘          │
+   │                  v                                            │
+   │        ┌────────────────────┐                                 │
+   │        │ frequency source   │                                 │
+   │        │  FIXED : FWORD     │                                 │
+   │        │  SWEEP : FSTART +  │                                 │
+   │        │   freq-accumulator │                                 │
+   │        │  PROF  : PROFn     │                                 │
+   │        └───────┬────────────┘                                 │
+   │                v                                              │
+   │       32-bit phase accumulator  + (POW << 16)                 │
+   │                v                                              │
+   │        ┌─ ¼-wave sine LUT (4096×13)                           │
+   │        ├─ square (phase < DUTY)                               │
+   │        ├─ triangle (folded phase)                             │
+   │        ├─ ramp (phase MSBs)                                   │
+   │        └─ WAVE RAM playback port (4096×14)                    │
+   │                v  14-bit signed                               │
+   │           × AMP (Q1.15, 0…1.0)                                │
+   │           + OFFSET (14-bit signed)                            │
+   │                v  round + saturate                            │
+   │           output stage: 14/12-bit, offset-bin / 2's comp, INV │
+   │                v                                              │
+   │           dac_data[13:0], dac_valid                           │
+   └───────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 Tuning equation
 
-The phase accumulator adds the effective frequency word every `dds_clk`
-cycle (Doc/dds.pdf, Sec. 1/3):
+The phase accumulator adds the effective frequency word every `dds_clk` cycle
+(Doc/dds.pdf, Sec. 1/3):
 
 ```
 fout        = FWORD × f_dds / 2^32
@@ -96,237 +98,310 @@ FWORD       = round(fout × 2^32 / f_dds)
 resolution  = f_dds / 2^32
 ```
 
-Example, f_dds = 50 MHz: 1 MHz → FWORD = round(2^32/50) = 85 899 346 =
-`0x051E_B852`. Keep `fout < f_dds/2` (Nyquist); with the intended
-≤ 10 MHz outputs from a 50 MHz clock there is ≥ 5× oversampling, which keeps
-the DAC reconstruction filter easy.
+At **f_dds = 100 MHz**: resolution = 23.3 mHz, and 1 MHz → FWORD =
+`0x028F_5C29`. Keep `fout < f_dds/2` (Nyquist); the AD9764 module's 32 MHz
+reconstruction filter (see AN01) wants `fout ≤ ~20 MHz` anyway, which leaves
+≥ 5 samples per cycle.
 
 ### 2.2 Waveform phase mapping
 
-All waveforms are derived from the offset phase `ph = phase + (POW << 16)`.
+All waveforms derive from the offset phase `ph = phase + (POW << 16)`;
 `ph = 0` is the period start.
 
 | Waveform | Value at ph = 0 | Definition |
 |---|---|---|
-| Sine     | 0, rising       | ¼-wave LUT, quadrant = ph[31:30], addr = ph[29:18] |
-| Cosine   | +FS             | sine with +90° (POW + 0x4000 internally) |
-| Square   | +FS             | +FS while ph[31:16] < DUTY, else −FS |
-| Triangle | −FS, rising     | folded ph, peak +FS at half period |
-| Ramp     | −FS, rising     | ph[31:18] as signed, wraps at period end |
-| User     | RAM[0]          | RAM address = ph[31:20] |
+| Sine     | 0, rising | ¼-wave LUT, quadrant = `ph[31:30]`, addr = `ph[29:18]` |
+| Cosine   | +FS       | sine advanced 90° (POW + 0x4000 internally) |
+| Square   | +FS       | +FS while `ph[31:16] < DUTY`, else −FS |
+| Triangle | −FS, rising | folded `ph`, peak +FS at half period |
+| Ramp     | −FS, rising | `ph[31:18]` as signed, wraps at period end |
+| User     | RAM[0]    | RAM address = `ph[31:20]` |
 
-The LUT stores `sin((i+0.5)/4096 × 90°) × 8191`; the half-LSB offset makes
-the quadrant symmetry exact, so the reconstructed sine has no DC offset and
-peaks at ±8191.
+The LUT stores `sin((i+0.5)/4096 × 90°) × 8191`; the half-LSB offset makes the
+quadrant symmetry exact, so the reconstructed sine has no DC offset and peaks
+at ±8191.
 
 ### 2.3 Amplitude path
 
-`sample(14-bit signed) × AMP(Q1.16) + OFFSET`, rounded to nearest and
-saturated to 14 bits (Doc/dds.pdf, Fig. 11.4). AMP = 0x10000 with OFFSET = 0
-is exactly 1.0 and a true identity (bit-exact pass-through). The OFFSET add
-shares the rounding stage, so it costs no extra latency. One DSP48
-implements the multiply.
+`sample(14-bit signed) × AMP(Q1.15) + OFFSET`, rounded to nearest and saturated
+to 14 bits (Doc/dds.pdf, Fig. 11.4). **AMP = 0x8000 is exactly 1.0** and a
+bit-exact pass-through; values above 0x8000 are clamped to 1.0 by the register
+file (a gain above full scale could only clip). The OFFSET add shares the
+rounding stage, so it costs no extra latency. One DSP48 implements the multiply.
+
+15 fractional bits of gain against a 14-bit DAC means the amplitude step is
+always below the DAC's own LSB — the 16-bit register loses nothing.
 
 ### 2.4 Pipeline latency
 
-Phase accumulator to `dac_data`: **6 dds_clk cycles**. Constant for all
-waveforms and settings; only matters if you align the output with external
-events.
+Phase accumulator to `dac_data`: **6 dds_clk cycles**, constant for every
+waveform and setting. Only matters if you align the output with external events.
 
 ---
 
 ## 3. Ports
 
-| Port | Dir | Width | Clock | Description |
-|---|---|---|---|---|
-| `PCLK`      | in  | 1  | —       | APB clock |
-| `PRESETn`   | in  | 1  | async   | APB domain reset, active low |
-| `PADDR`     | in  | 15 | PCLK    | Byte address (see map; bit 14 selects WAVE RAM) |
-| `PSEL`      | in  | 1  | PCLK    | APB select |
-| `PENABLE`   | in  | 1  | PCLK    | APB enable (access phase) |
-| `PWRITE`    | in  | 1  | PCLK    | 1 = write |
-| `PWDATA`    | in  | 32 | PCLK    | Write data |
-| `PRDATA`    | out | 32 | PCLK    | Read data |
-| `PREADY`    | out | 1  | PCLK    | Tied high — every access completes in one cycle |
-| `dds_clk`   | in  | 1  | —       | Sample clock (= DAC clock). May equal PCLK. |
-| `dds_rstn`  | in  | 1  | async   | Sample domain reset, active low |
-| `sweep_trig`| in  | 1  | async   | Sweep start, rising edge (when SWEEP_CTRL.EXT_TRIG_EN=1). Synchronized internally. |
-| `hop_sel`   | in  | 2  | async   | Profile select (when PROF_CTRL.EXT_SEL_EN=1). Synchronized + 2-cycle agreement filter. |
-| `dac_data`  | out | 14 | dds_clk | Parallel DAC data, registered |
-| `dac_valid` | out | 1  | dds_clk | High while output is live (CTRL.EN, pipeline filled) |
-| `dds_irq`   | out | 1  | PCLK    | Level interrupt, `|(IRQ_STAT & IRQ_EN)` |
+```verilog
+dds_top #(
+    .NUM_CH       (2),                  // 1 or 2
+    .SIN_LUT_FILE ("dds_sin_lut.mem")
+) u_dds (
+    .dds_clk(clk100), .dds_rstn(rstn),
+    .spi_sck(sck), .spi_cs_n(cs_n), .spi_mosi(mosi),
+    .spi_miso(miso), .spi_miso_oe(miso_oe),
+    .ch0_sweep_trig(1'b0), .ch0_hop_sel(2'b00),
+    .ch1_sweep_trig(1'b0), .ch1_hop_sel(2'b00),
+    .ch0_dac_data(dac0), .ch0_dac_valid(dv0),
+    .ch1_dac_data(dac1), .ch1_dac_valid(dv1),
+    .dds_irq(irq)
+);
+```
 
-Parameter `SIN_LUT_FILE` (default `"dds_sin_lut.mem"`): path of the sine LUT
-init file for `$readmemh`.
+| Port | Dir | Width | Description |
+|---|---|---|---|
+| `dds_clk`        | in  | 1  | The clock. DAC sample clock, SPI oversampling clock, register clock. |
+| `dds_rstn`       | in  | 1  | Active-low reset; assert asynchronously, release synchronously. |
+| `spi_sck`        | in  | 1  | SPI clock (asynchronous, oversampled). `f_sck ≤ dds_clk / 6`. |
+| `spi_cs_n`       | in  | 1  | Chip select, active low. Its rising edge commits the frame. |
+| `spi_mosi`       | in  | 1  | Master → slave data. |
+| `spi_miso`       | out | 1  | Slave → master data. |
+| `spi_miso_oe`    | out | 1  | High while a frame is active — for a tri-stated/shared MISO net. Ignore for a dedicated pin. |
+| `chN_sweep_trig` | in  | 1  | Rising edge starts a sweep when `SWEEP_CTRL.EXT_TRIG = 1`. Synchronized internally. |
+| `chN_hop_sel`    | in  | 2  | Profile select when `PROF_CTRL.EXT_SEL = 1`. Synchronized + 2-cycle agreement filter. |
+| `chN_dac_data`   | out | 14 | Parallel DAC data, registered. |
+| `chN_dac_valid`  | out | 1  | High while the output is live (CTRL.EN and the pipeline is full). |
+| `dds_irq`        | out | 2  | One level interrupt per channel, `|(IRQ_STAT & IRQ_EN)`. |
+
+With `NUM_CH = 1`, the channel-1 outputs are tied off and frames addressed to
+channel 1 are ignored.
 
 ---
 
-## 4. Clocking and Reset
+## 4. SPI Protocol
 
-- **Single-clock use (recommended to start):** drive `PCLK` and `dds_clk`
-  from the same PLL output (e.g. 50 MHz from the on-board oscillator via
-  PLL/MMCM). The internal CDC logic is harmless in this case and no extra
-  timing constraints are needed.
-- **Dual-clock use:** any frequency relationship is allowed. Constrain the
-  crossings (Section 9.2). The double-buffer handshake guarantees the active
-  configuration set changes in exactly one `dds_clk` cycle.
-- Signals ≤ 10 MHz from a 50 MHz `dds_clk` gives ≥ 5 samples/cycle; if you
-  later want cleaner high-frequency sines, raise only `dds_clk` (e.g.
-  100–150 MHz) — the design is a short pipeline and closes timing easily.
-- Both resets are active-low and may be asserted asynchronously; release them
-  synchronously to their domains (normal PLL-locked reset practice).
-- The DAC clock pin should be forwarded from `dds_clk` with an ODDR output
-  buffer; sample `dac_data` in the DAC on the edge its datasheet specifies.
+**Mode 0** (CPOL = 0, CPHA = 0): MOSI/MISO change on the falling edge of SCK,
+both ends sample on the rising edge. MSB first, 16-bit words, CS active low.
+
+### 4.1 Frame format
+
+```
+       CS_N ‾‾‾\____________________________________________/‾‾‾‾
+                | CMD (16) | D0 (16) | D1 (16) | ... |
+                                                          ^
+                                                          commit
+CMD:  15   14   13                                     0
+     ┌────┬────┬──────────────────────────────────────┐
+     │ RW │ CH │              ADDR[13:0]              │
+     └────┴────┴──────────────────────────────────────┘
+      1=wr  channel        word address, auto-increments
+```
+
+- **Write**: `D0 → ADDR`, `D1 → ADDR+1`, … Any number of data words.
+- **Read**: the word right after CMD is a **turnaround word** (MISO reads
+  0x0000); read data starts in the third word:
+
+```
+  master:  [CMD] [dummy]  [dummy]   [dummy]   ...
+  slave:   [0]   [0]      [ADDR]    [ADDR+1]  ...
+```
+
+The address pointer runs one word ahead of MISO, so the register or BRAM read
+always has a full word time (16 SCK) to settle.
+
+### 4.2 The commit point
+
+**The rising edge of CS applies everything the frame wrote.** Config writes land
+in shadow registers; the datapath latches them as one atomic set at frame end.
+Consequences worth relying on:
+
+- A 32-bit frequency word written as `FWORD_L` + `FWORD_H` in one frame
+  produces **no intermediate frequency** on the DAC.
+- "Write the sweep config **and** the START bit in one frame" always starts the
+  sweep with the config from that same frame — the commit is ordered before the
+  start strobe.
+- `UPDATE.AUTO = 1` (reset default) commits every frame that touched config.
+  With `AUTO = 0`, shadow writes accumulate across frames until a frame writes
+  `UPDATE.UPD = 1` — that is how you retune both channels or many parameters at
+  a single instant.
+
+### 4.3 Timing
+
+The SPI pins are **oversampled in the `dds_clk` domain** (2-FF synchronizers,
+edge detection) — there are no SCK-clocked flops and no BUFG on a slow external
+clock. The one rule this imposes:
+
+```
+f_sck  ≤  dds_clk / 6
+```
+
+At `dds_clk` = 100 MHz that allows up to 16.6 MHz. The STM32F103 firmware runs
+SPI1 at **9 MHz** (72 MHz / 8), i.e. 11× oversampling. The testbench passes at
+both 9 MHz and the 16 MHz limit.
+
+MISO is updated right after the rising edge that completes a word — a full half
+SCK period before the master samples it — so no extra setup constraint applies
+at the master.
+
+Keep CS low for the whole frame and raise it between frames. Back-to-back words
+inside a frame need no gap.
 
 ---
 
 ## 5. Register Map
 
-32-bit registers, byte-addressed. Register block decodes `PADDR[7:2]` when
-`PADDR[14] = 0`; the waveform RAM occupies `PADDR[14] = 1` (0x4000–0x7FFF).
-Reserved bits read 0 and must be written 0. **W1SC** = write-1, self-clearing
-(reads 0). **W1C** = write 1 to clear.
+16-bit registers, **word-addressed** (ADDR is a word index, not a byte offset).
+The register block decodes `ADDR[5:0]` when `ADDR[13] = 0`; the waveform RAM
+occupies `ADDR[13] = 1` (0x2000–0x2FFF). Each channel has its own complete copy
+of this map, selected by CMD[14].
 
-| Offset | Name | Access | Reset | Function |
+Reserved bits read 0 and should be written 0.
+**W1SC** = write 1, self-clearing (reads 0). **W1C** = write 1 to clear.
+
+| Addr | Name | Access | Reset | Function |
 |---|---|---|---|---|
-| 0x00 | ID           | RO  | 0x4453_0110 | "DS" + version 1.1.0 |
-| 0x04 | CTRL         | RW  | 0x0000_0000 | Enable, waveform, frequency mode, output format |
-| 0x08 | STATUS       | RO  | 0x0000_0000 | Sweep/profile/update status |
-| 0x0C | FWORD        | RW  | 0x0000_0000 | Frequency tuning word (FIXED mode) |
-| 0x10 | POW          | RW  | 0x0000_0000 | Phase offset word |
-| 0x14 | AMP          | RW  | 0x0001_0000 | Amplitude scale (reset = 1.0) |
-| 0x18 | DUTY         | RW  | 0x0000_8000 | Square duty threshold (reset = 50 %) |
-| 0x1C | UPDATE       | RW  | 0x0000_0002 | Update strobe / auto-update (reset: AUTO on) |
-| 0x20 | SWEEP_CTRL   | RW  | 0x0000_0000 | Sweep mode, trigger source, START/ABORT |
-| 0x24 | SWEEP_FSTART | RW  | 0x0000_0000 | Sweep start tuning word (f1) |
-| 0x28 | SWEEP_FSTOP  | RW  | 0x0000_0000 | Sweep stop tuning word (f2 ≥ f1) |
-| 0x2C | SWEEP_FDELTA | RW  | 0x0000_0000 | Frequency increment per ramp step |
-| 0x30 | SWEEP_RATE   | RW  | 0x0000_0001 | dds_clk cycles per ramp step |
-| 0x34 | PROF_CTRL    | RW  | 0x0000_0000 | Profile select source & index |
-| 0x38 | PROF0_FWORD  | RW  | 0x0000_0000 | Profile 0 tuning word |
-| 0x3C | PROF1_FWORD  | RW  | 0x0000_0000 | Profile 1 tuning word |
-| 0x40 | PROF2_FWORD  | RW  | 0x0000_0000 | Profile 2 tuning word |
-| 0x44 | PROF3_FWORD  | RW  | 0x0000_0000 | Profile 3 tuning word |
-| 0x48 | PROF_POW10   | RW  | 0x0000_0000 | [15:0] profile 0 phase, [31:16] profile 1 phase |
-| 0x4C | PROF_POW32   | RW  | 0x0000_0000 | [15:0] profile 2 phase, [31:16] profile 3 phase |
-| 0x50 | IRQ_EN       | RW  | 0x0000_0000 | Interrupt enables |
-| 0x54 | IRQ_STAT     | W1C | 0x0000_0000 | Interrupt flags |
-| 0x58 | OFFSET       | RW  | 0x0000_0000 | DC offset, 14-bit signed |
-| 0x4000–0x7FFC | WAVE_RAM | RW | undefined | 4096 × 32-bit words; sample in [13:0]. Entry n at 0x4000 + 4n |
+| 0x00 | `ID`            | RO  | 0x4453 | Identification ("DS") |
+| 0x01 | `VERSION`       | RO  | 0x0200 | Major.minor |
+| 0x02 | `CTRL`          | RW  | 0x0000 | Enable, waveform, mode, output format |
+| 0x03 | `STATUS`        | RO  | —      | Sweep and profile state |
+| 0x04 | `FWORD_L`       | RW  | 0x0000 | Tuning word [15:0] |
+| 0x05 | `FWORD_H`       | RW  | 0x0000 | Tuning word [31:16] |
+| 0x06 | `POW`           | RW  | 0x0000 | Phase offset, 65536 = 360° |
+| 0x07 | `AMP`           | RW  | 0x8000 | Amplitude, Q1.15 (0x8000 = 1.0, clamped) |
+| 0x08 | `DUTY`          | RW  | 0x8000 | Square duty, 65536 = 100 % |
+| 0x09 | `OFFSET`        | RW  | 0x0000 | DC offset, 14-bit signed |
+| 0x0A | `UPDATE`        | RW  | 0x0002 | Commit control |
+| 0x0B | `SWEEP_CTRL`    | RW  | 0x0000 | Sweep mode, trigger source, start/abort |
+| 0x0C | `SWEEP_FSTART_L`| RW  | 0x0000 | Sweep start frequency [15:0] |
+| 0x0D | `SWEEP_FSTART_H`| RW  | 0x0000 | … [31:16] |
+| 0x0E | `SWEEP_FSTOP_L` | RW  | 0x0000 | Sweep stop frequency [15:0] |
+| 0x0F | `SWEEP_FSTOP_H` | RW  | 0x0000 | … [31:16] |
+| 0x10 | `SWEEP_FDELTA_L`| RW  | 0x0000 | Frequency step [15:0] |
+| 0x11 | `SWEEP_FDELTA_H`| RW  | 0x0000 | … [31:16] |
+| 0x12 | `SWEEP_RATE_L`  | RW  | 0x0001 | dds_clk cycles per step [15:0] |
+| 0x13 | `SWEEP_RATE_H`  | RW  | 0x0000 | … [31:16] |
+| 0x14 | `PROF_CTRL`     | RW  | 0x0000 | Profile select and source |
+| 0x15 | `PROF0_FWORD_L` | RW  | 0x0000 | Profile 0 tuning word [15:0] |
+| 0x16 | `PROF0_FWORD_H` | RW  | 0x0000 | … [31:16] |
+| 0x17…0x1C | `PROF1…3_FWORD_L/H` | RW | 0x0000 | Profiles 1–3, same layout |
+| 0x1D | `PROF0_POW`     | RW  | 0x0000 | Profile 0 phase offset |
+| 0x1E…0x20 | `PROF1…3_POW` | RW | 0x0000 | Profiles 1–3 phase offsets |
+| 0x21 | `IRQ_EN`        | RW  | 0x0000 | Interrupt enables |
+| 0x22 | `IRQ_STAT`      | W1C | 0x0000 | Interrupt flags |
+| 0x2000–0x2FFF | `WAVE_RAM` | RW | — | User waveform, 4096 × 14-bit signed |
 
-### 5.1 CTRL (0x04)
+### 5.1 CTRL (0x02)
 
-| Bits | Field | Description |
+| Bit | Name | Access | Description |
+|---|---|---|---|
+| 0     | `EN`      | RW   | 1 = run. 0 = phase accumulator frozen, DAC held at mid-scale. |
+| 1     | `SRST`    | W1SC | Soft reset: zeroes the phase accumulator, stops any sweep, clears IRQ flags. |
+| 3:2   | —         | —    | Reserved |
+| 6:4   | `WAVE`    | RW   | 0 sine, 1 cosine, 2 square, 3 triangle, 4 ramp, 5 user RAM |
+| 7     | —         | —    | Reserved |
+| 9:8   | `FMODE`   | RW   | 0 FIXED, 1 SWEEP, 2 PROFILE |
+| 11:10 | —         | —    | Reserved |
+| 12    | `OUT12`   | RW   | 1 = 12-bit output, rounded and MSB-aligned into `dac_data[13:2]` |
+| 13    | `FMT_2C`  | RW   | 1 = two's complement, 0 = offset binary (what most current-output DACs want) |
+| 14    | `INV`     | RW   | 1 = invert the waveform (negate before coding) |
+
+`SRST` is a strobe: it acts on the frame commit and reads back 0.
+
+### 5.2 STATUS (0x03, read-only)
+
+| Bit | Name | Description |
 |---|---|---|
-| 0     | EN        | 1 = run. 0 = phase/frequency accumulators freeze (state kept), output forced to mid-scale, `dac_valid` low. **Takes effect immediately**, without an UPDATE. |
-| 1     | SRST      | W1SC. Soft reset: clears the phase accumulator, sweep state and IRQ_STAT. Register contents are kept. |
-| 6:4   | WAVE_SEL  | 0 sine · 1 cosine · 2 square · 3 triangle · 4 ramp · 5 user RAM · 6–7 reserved |
-| 9:8   | FREQ_MODE | 0 FIXED · 1 SWEEP · 2 PROFILE · 3 reserved |
-| 12    | OUT_WIDTH | 0 = 14-bit; 1 = 12-bit, MSB-aligned: the rounded 12-bit result drives `dac_data[13:2]`, `dac_data[1:0]` = 0. Connect a 12-bit DAC to `dac_data[13:2]`. |
-| 13    | OUT_FMT   | 0 = offset binary (mid-scale 0x2000); 1 = two's complement. |
-| 14    | OUT_INV   | 1 = invert output polarity (saturating negate). |
+| 0   | `SWEEP_ACTIVE` | A sweep is running |
+| 1   | `SWEEP_DIR`    | 1 = currently sweeping down (UPDOWN mode) |
+| 3:2 | `ACTIVE_PROF`  | Profile currently driving the accumulator |
 
-All CTRL fields except EN and SRST travel through the double-buffer (Sec. 6.1).
+### 5.3 FWORD (0x04/0x05)
 
-### 5.2 STATUS (0x08, read-only)
+The FIXED-mode tuning word; see the tuning equation (Sec. 2.1). Write both
+halves **in one frame** so they commit together.
 
-| Bits | Field | Description |
-|---|---|---|
-| 0   | SWEEP_ACTIVE | Sweep running. |
-| 1   | SWEEP_DIR    | 0 = up, 1 = down (up/down mode). |
-| 3:2 | ACTIVE_PROF  | Profile currently applied. Informational; bits are synchronized independently and may tear for one read during a hop. |
-| 4   | UPD_PENDING  | 1 = a shadow→active transfer is in flight. Poll until 0 before relying on new settings (or use the UPD_DONE interrupt). |
+### 5.4 POW (0x06)
 
-### 5.3 FWORD (0x0C) — see tuning equation, Sec. 2.1.
+Phase offset added to the accumulator output: `65536 = 360°`, resolution
+0.0055°. Changing POW shifts the phase without disturbing the frequency.
 
-### 5.4 POW (0x10)
+### 5.5 AMP (0x07)
 
-| Bits | Field | Description |
-|---|---|---|
-| 15:0 | POW | Phase offset = POW/65536 × 360°. 0x4000 = 90°, 0x8000 = 180°. Applies in FIXED and SWEEP modes (PROFILE mode uses the per-profile phase). |
+Q1.15 amplitude: `0x8000 = 1.0` (full scale), `0x4000 = 0.5`, `0x0000` = silent.
+Writes above 0x8000 are clamped to 0x8000. The peak output voltage is set by the
+external DAC/filter chain; this only scales digitally.
 
-### 5.5 AMP (0x14)
+### 5.6 DUTY (0x08)
 
-| Bits | Field | Description |
-|---|---|---|
-| 16:0 | AMP | Q1.16 amplitude: gain = AMP/65536. 0x00000 = 0 (output at code mid-scale), 0x08000 = 0.5, 0x10000 = 1.0 (exact, bit-transparent). Writes above 0x10000 are stored clamped to 0x10000. |
+Square-wave duty cycle: `65536 = 100 %`, so `0x8000` = 50 %, `0x4000` = 25 %.
+Affects the square waveform only.
 
-### 5.6 DUTY (0x18)
+### 5.7 OFFSET (0x09)
 
-| Bits | Field | Description |
-|---|---|---|
-| 15:0 | DUTY | Square high-time fraction = DUTY/65536 (resolution ≈ 0.0015 %). 0x0000 = constant −FS; exactly 100 % is not reachable (max 65535/65536). Ignored for other waveforms. |
+14-bit signed DC offset (−8192 … +8191), added after the amplitude scaler and
+saturated. `AMP = 0` plus a non-zero OFFSET outputs a **pure DC level** — handy
+for a programmable bias.
 
-### 5.7 UPDATE (0x1C)
+### 5.8 UPDATE (0x0A)
 
-| Bits | Field | Description |
-|---|---|---|
-| 0 | UPD  | W1SC. Captures all shadow settings and transfers them atomically to the dds_clk domain. |
-| 1 | AUTO | 1 (reset default) = every write to a configuration register triggers the capture automatically. 0 = writes accumulate until UPD is written. |
+| Bit | Name | Access | Description |
+|---|---|---|---|
+| 0 | `UPD`  | W1SC | Commit the shadow registers at this frame's end |
+| 1 | `AUTO` | RW   | 1 (default) = commit at the end of every frame that wrote config |
 
-### 5.8 SWEEP_CTRL (0x20)
+### 5.9 SWEEP_CTRL (0x0B)
 
-| Bits | Field | Description |
-|---|---|---|
-| 1:0 | MODE        | 0 = single (f1→f2, then hold f2, SWEEP_DONE) · 1 = sawtooth repeat (wrap to f1, SWEEP_WRAP per lap) · 2 = up/down (f1→f2→f1→…, SWEEP_WRAP per reversal) · 3 reserved |
-| 2   | EXT_TRIG_EN | 1 = start on `sweep_trig` rising edge instead of the START bit. |
-| 8   | START       | W1SC. Software start (FREQ_MODE must be SWEEP). Restarting an active sweep restarts it from f1. |
-| 9   | ABORT       | W1SC. Stops the sweep; output returns to f1. |
+| Bit | Name | Access | Description |
+|---|---|---|---|
+| 1:0 | `MODE`     | RW   | 0 SINGLE (run once, hold at FSTOP), 1 SAW (repeat from FSTART), 2 UPDOWN (ping-pong) |
+| 2   | `EXT_TRIG` | RW   | 1 = start on the rising edge of `sweep_trig` instead of the START bit |
+| 8   | `START`    | W1SC | Start / restart the sweep |
+| 9   | `ABORT`    | W1SC | Stop the sweep and return to FSTART |
 
-**Sweep behaviour** (Doc/dds.pdf Fig. 11.3): an internal frequency
-accumulator starts at 0 and adds FDELTA every RATE `dds_clk` cycles; the
-phase-accumulator input is FSTART + accumulator, clamped so it never exceeds
-FSTOP. Requirements: FSTOP ≥ FSTART, FDELTA ≥ 1. Timing:
+The sweep engine ramps **upward only**: `FSTOP > FSTART`. It adds `FDELTA` to
+the tuning word every `RATE` dds_clk cycles, so
 
 ```
-steps          = ceil((FSTOP − FSTART) / FDELTA)
-sweep duration = steps × RATE / f_dds
+steps    = ceil((FSTOP − FSTART) / FDELTA)
+duration = steps × RATE / f_dds
 ```
 
-Writing FDELTA mid-sweep (it re-arrives via the normal update mechanism)
-changes the slope without restarting — piecewise-linear/nonlinear chirps.
-Selecting FREQ_MODE ≠ SWEEP force-stops any active sweep.
+The sweep only advances while `CTRL.EN = 1`, and `FMODE` must be SWEEP.
 
-### 5.9 SWEEP_RATE (0x30)
+### 5.10 SWEEP_RATE (0x12/0x13)
 
-| Bits | Field | Description |
+dds_clk cycles per frequency step. 0 is treated as 1. 32 bits, so a single
+sweep can run from microseconds to tens of seconds.
+
+### 5.11 PROF_CTRL (0x14)
+
+| Bit | Name | Access | Description |
+|---|---|---|---|
+| 1:0 | `SEL`      | RW | Active profile 0–3 (when EXT_SEL = 0) |
+| 4   | `EXT_SEL`  | RW | 1 = take the profile number from the `hop_sel[1:0]` pins |
+
+With `EXT_SEL = 1` another block (or a pin) can hop frequency/phase at the
+sample rate with no SPI traffic at all — FSK/PSK modulation with zero CPU load.
+
+### 5.12 IRQ_EN (0x21) / IRQ_STAT (0x22)
+
+| Bit | Name | Description |
 |---|---|---|
-| 23:0 | RATE | dds_clk cycles between frequency steps. 0 and 1 both mean every cycle. Max 16 777 215 (0.34 s per step at 50 MHz). |
+| 0 | `SWEEP_DONE` | A SINGLE sweep reached FSTOP |
+| 1 | `SWEEP_WRAP` | A SAW sweep restarted, or an UPDOWN sweep reversed |
+| 2 | `UPD_DONE`   | The datapath latched a new configuration |
 
-### 5.10 PROF_CTRL (0x34)
+`IRQ_STAT` is write-1-to-clear; `dds_irq[ch] = |(IRQ_STAT & IRQ_EN)`. A
+simultaneous event wins over a clear, so no event is ever lost.
 
-| Bits | Field | Description |
-|---|---|---|
-| 1:0 | SEL        | Active profile when EXT_SEL_EN = 0. |
-| 4   | EXT_SEL_EN | 1 = active profile follows `hop_sel[1:0]`. Profile switches are phase-continuous. In PROFILE mode the phase offset comes from the selected profile's POW field, enabling PSK as well as FSK. |
+### 5.13 WAVE_RAM (0x2000–0x2FFF)
 
-### 5.11 IRQ_EN (0x50) / IRQ_STAT (0x54)
+4096 × 14-bit signed samples, one full period. Only the low 14 bits of each
+written word are stored; readback returns them zero-extended. Playback address
+is `ph[31:20]`, so the table is traversed once per period at any frequency.
 
-Identical layout. A flag sets regardless of the enable; the enable only gates
-`dds_irq`. Clear by writing 1 to the flag (or CTRL.SRST clears all).
-
-| Bit | Flag | Set when |
-|---|---|---|
-| 0 | SWEEP_DONE | Single-mode sweep reached FSTOP. |
-| 1 | SWEEP_WRAP | Repeating sweep wrapped / up-down sweep reversed. |
-| 2 | UPD_DONE   | A configuration transfer was applied in the dds_clk domain. |
-
-### 5.12 OFFSET (0x58)
-
-| Bits | Field | Description |
-|---|---|---|
-| 13:0 | OFFSET | DC offset, 14-bit two's complement (−8192 … +8191), same LSB weight as the output sample. Added **after** the amplitude multiplier with saturation to ±full-scale, so |waveform amplitude| + |offset| beyond full scale clips cleanly. OUT_INV inverts the waveform only, not the offset. With AMP = 0 the output is a pure programmable DC level. In 12-bit mode the offset is applied before the 14→12 rounding (LSB weight stays 1/8192 of full scale). |
-
-### 5.13 WAVE_RAM (0x4000–0x7FFC)
-
-4096 words; bits [13:0] hold one two's-complement sample at DAC full scale
-(−8192…+8191); bits [31:14] are ignored and read 0. Playback address is
-`ph[31:20]`, so the RAM holds exactly one waveform period. Reads and writes
-are allowed at any time with zero wait states; to avoid output glitches,
-reload the RAM while WAVE_SEL ≠ 5 or EN = 0. Contents are **not** cleared by
-reset and are undefined at power-up — initialize before selecting the user
-waveform. AMP scaling and output formatting apply to RAM samples exactly as
-to the built-in waveforms.
+Writing the RAM while `WAVE = user` is live is allowed — the DAC simply plays
+the new samples as they land. Load the table with the channel disabled or on a
+different waveform if you need a clean switch.
 
 ---
 
@@ -334,183 +409,163 @@ to the built-in waveforms.
 
 ### 6.1 Configuration update mechanism
 
-Every APB write lands in a *shadow* register immediately (and reads back from
-there). The datapath, however, only sees the *active* set in the `dds_clk`
-domain, which is reloaded — all fields at once, in one cycle — when a capture
-event crosses the domain boundary:
+```
+ SPI write ──> shadow regs ──┐
+                             │  frame_end (CS rising)
+ UPDATE.AUTO=1 ──────────────┼──> cfg_apply ──> active regs in the datapath
+ or UPDATE.UPD=1 ────────────┘                  (one cycle, all together)
+```
 
-1. Write with AUTO = 1, or write UPDATE.UPD = 1.
-2. One PCLK cycle later the shadows are captured into a transfer set and a
-   toggle crosses to `dds_clk` (STATUS.UPD_PENDING = 1).
-3. The core loads the active registers, flips an acknowledge toggle back.
-4. UPD_PENDING clears; IRQ_STAT.UPD_DONE sets.
+Because the commit is one cycle wide and takes every parameter at once, a
+retune is **phase-continuous**: the accumulator keeps its phase and only the
+increment changes. Nothing glitches, and the DAC never sees a torn 32-bit word.
 
-A request arriving while a transfer is in flight is remembered and re-issued
-once, so the final state always matches the last write; nothing is lost.
-Latency is ~4 PCLK + ~4 dds_clk cycles. Frequency, phase, amplitude and
-waveform changes are **phase-continuous**: the phase accumulator is never
-reset by an update (only by CTRL.SRST or hardware reset).
-
-Recommended driver pattern for multi-register changes (e.g. a whole sweep
-setup): write UPDATE = 0 (AUTO off), program everything, write UPDATE = 1
-(UPD), then either poll STATUS.UPD_PENDING = 0 or wait for UPD_DONE before
-issuing START. Single-register tweaks (retune FWORD, change AMP) are safe
-with AUTO on — one write, done.
-
-START/ABORT/SRST strobes are ordered after the configuration capture
-internally, so a single SWEEP_CTRL write carrying mode bits *and* START (with
-AUTO on) applies the mode first. Still, separating configuration from START
-is the cleaner driver style.
+Soft reset and the sweep START/ABORT strobes are deferred to the same commit
+point, which is what makes "config + START in one frame" behave sanely.
 
 ### 6.2 Frequency modes
 
-**FIXED.** Output frequency = FWORD. Retune by writing FWORD; the transition
-is instantaneous and phase-continuous (Doc/dds.pdf Sec. 3 — suited to
-hopping/GMSK-style signalling at APB speed).
+- **FIXED** — the accumulator is driven by `FWORD`.
+- **SWEEP** — driven by `FSTART + freq_offset`, where the frequency accumulator
+  adds `FDELTA` every `RATE` cycles up to `FSTOP` (tutorial Fig. 11.3). Mode
+  SINGLE stops and raises `SWEEP_DONE`; SAW jumps back to FSTART and raises
+  `SWEEP_WRAP`; UPDOWN reverses at both ends.
+- **PROFILE** — driven by `PROFn_FWORD`, with `PROFn_POW` as the phase offset.
+  Switching profiles changes frequency **and** phase in one sample period.
 
-**SWEEP.** See 5.8. The chirp is generated entirely in hardware; the CPU
-only arms it. With EXT_TRIG_EN another IP block (timer, SPI event, radar
-frame pulse on `sweep_trig`) starts sweeps with cycle-level determinism.
-
-**PROFILE.** Four {FWORD, POW} pairs are pre-programmed; hopping between
-them costs zero APB traffic when `hop_sel` pins drive the selection —
-maximum hop rate is limited only by the input synchronizer (~4 dds_clk
-cycles). 2-FSK uses profiles 0/1 on `hop_sel[0]`; 4-FSK/QPSK uses all four.
+Changing `FMODE` away from SWEEP resets the sweep engine.
 
 ### 6.3 Output stage and DAC connection
 
-Processing order: waveform sample → INV → × AMP → round → + OFFSET →
-saturate → 12-bit rounding (if OUT_WIDTH) → coding (OUT_FMT) → register →
-`dac_data`.
+```
+14-bit signed sample
+   │  OUT12=1 → round to 12 bits, saturate, place in dac_data[13:2]
+   │  FMT_2C=0 → invert the MSB (offset binary)
+   │  INV=1    → negate first
+   v
+dac_data[13:0]   (mid-scale when disabled: 0x2000 offset binary / 0x0000 2's comp)
+```
 
-- **14-bit DAC:** connect `dac_data[13:0]` directly.
-- **12-bit DAC:** set OUT_WIDTH = 1, connect the DAC to `dac_data[13:2]`.
-  The 14→12 conversion is round-to-nearest with saturation (not truncation),
-  preserving ~0.25 LSB of accuracy.
-- When EN = 0, `dac_data` holds mid-scale in the selected coding (0x2000
-  offset-binary / 0x0000 two's-complement) and `dac_valid` is low — the DAC
-  rests at 0 V differential.
+For the AD9764 module in AN01: **offset binary, 14-bit** (`FMT_2C = 0`,
+`OUT12 = 0`). See that application note for the data-to-clock timing (forward
+the DAC clock with an ODDR so data is stable at the DAC's rising edge).
 
 ### 6.4 Spectral notes (from Doc/dds.pdf)
 
-- Aliased images appear at `k·f_dds ± fout` (Sec. 2); the analog
-  reconstruction filter after the DAC must attenuate them. At ≥ 5×
-  oversampling the first image is ≥ 3× fout away — an easy filter.
-- sin(x)/x droop at fout = 10 MHz, f_dds = 50 MHz is ≈ −0.58 dB; compensate
-  in the DAC filter if flatness matters.
-- Phase truncation spurs ≤ −84 dBc (14-bit phase index); DAC quantization
-  dominates. Clock jitter on `dds_clk` translates directly to output phase
-  noise — use a clean PLL output, not a ring-oscillator clock.
+- Phase truncation (32-bit accumulator → 12-bit LUT address after the
+  quadrant bits) is the dominant spur mechanism; with 12 address bits the
+  worst-case spur sits near −78 dBc, below the 14-bit DAC's own quantization
+  floor (≈ −86 dBc SFDR ideal, less in practice).
+- Images appear at `k × f_dds ± fout`. Choosing `dds_clk` = 100 MHz puts the
+  first image of a 10 MHz output at 90 MHz, far inside the AD9764 module's
+  32 MHz filter stopband — this is the whole reason for 100 MHz over 50 MHz.
+- The `sin(x)/x` roll-off of the DAC's zero-order hold is −0.9 dB at
+  `0.2 × f_dds` and −3.9 dB at `0.5 × f_dds`. Compensate in the analog chain if
+  you need flatness above ~20 MHz.
 
 ---
 
-## 7. APB Interface and Programming Examples
+## 7. Programming Examples
 
-### 7.1 Protocol
+Frames are written as `CMD, D0, D1, …`. `W(ch,addr)` = `0x8000 | ch<<14 | addr`.
 
-Standard APB write: **setup** cycle (PSEL = 1, PENABLE = 0, address/data/
-PWRITE valid) followed by one **access** cycle (PENABLE = 1). PREADY is tied
-high, so every transfer — including WAVE_RAM — completes in the access cycle
-with zero wait states (RAM reads are pre-fetched during setup). The core is
-compatible with any APB3/APB4 master; PSTRB/PPROT/PSLVERR are not used.
+The CTRL words below use **offset-binary** output (bit 13 = 0), which is what
+the AD9764 module and most current-output DACs want, and what the core powers
+up as. For a two's-complement DAC, OR in bit 13 (`| 0x2000`). Getting this
+wrong does not silence the DAC — it inverts every sample's MSB, and the sine
+comes out chopped in half with a half-scale jump each half period.
 
-```
-PCLK    ──┐_┌─┐_┌─┐_┌─
-PSEL    ___┌────────┐___
-PENABLE _______┌────┐___
-PADDR   ───X  addr   X──
-PWDATA  ───X  data   X──   (writes)
-PRDATA  ───────X data X─   (reads, valid in access cycle)
-```
-
-All examples below assume f_dds = 50 MHz and a base address of 0 (add your
-fabric's base offset).
-
-### 7.2 Generate a 1 MHz sine, full amplitude
+### 7.1 Identify the core
 
 ```
-FWORD = round(1e6 × 2^32 / 50e6) = 0x051E_B852
-
-write 0x0C, 0x051EB852     // FWORD          (AUTO on: applied immediately)
-write 0x04, 0x00002001     // CTRL: EN, sine, FIXED, 14-bit, two's complement
+frame: 0x0000, 0x0000, 0x0000      // read ch0 ADDR 0x00 (CMD, turnaround, data)
+       → third word reads 0x4453
 ```
 
-### 7.3 Retune to 2.5 MHz, half amplitude, +90° phase
+### 7.2 1 MHz full-scale sine on channel 0 (f_dds = 100 MHz)
 
 ```
-write 0x0C, 0x0CCCCCCD     // FWORD = 2.5e6 × 2^32 / 50e6
-write 0x14, 0x00008000     // AMP  = 0.5
-write 0x10, 0x00004000     // POW  = 90°
-```
-Each write is applied on the fly, phase-continuously.
-
-### 7.4 100 kHz square wave, 30 % duty, on a 12-bit offset-binary DAC
-
-```
-write 0x0C, 0x0083126F     // FWORD = 100e3 × 2^32 / 50e6
-write 0x18, 0x00004CCD     // DUTY  = 0.30 × 65536
-write 0x04, 0x00001021     // CTRL: EN, square, 12-bit, offset binary
+frame: 0x8004, 0x5C29, 0x028F      // FWORD = 0x028F5C29, both halves atomically
+frame: 0x8002, 0x0001              // CTRL: EN, sine, FIXED (offset binary)
 ```
 
-### 7.4b Sine riding on a DC bias / pure DC level
+### 7.3 Retune to 2.5 MHz at half amplitude, +90° phase
 
 ```
-write 0x14, 0x00008000     // AMP    = 0.5 (leave headroom for the bias)
-write 0x58, 0x00000800     // OFFSET = +2048 (+25 % of full scale)
-                           // -> sine swings -25 % … +75 % of full scale
-
-write 0x14, 0x00000000     // AMP = 0:
-write 0x58, 0x000003E8     // output is a constant DC level of +1000 LSB
+frame: 0x8004, 0x6666, 0x0666      // FWORD = 0x06666666
+frame: 0x8007, 0x4000              // AMP = 0.5
+frame: 0x8006, 0x4000              // POW = 90 degrees
 ```
 
-### 7.5 Hardware-timed sweep: 100 kHz → 1 MHz in 10 ms, repeating
+Each frame commits on its own CS edge; the retune is phase-continuous.
+
+### 7.4 100 kHz square, 30 % duty, offset-binary 12-bit DAC
 
 ```
-write 0x1C, 0x00000000     // UPDATE: AUTO off — program the set atomically
-write 0x24, 0x0083126F     // FSTART = 100 kHz
-write 0x28, 0x051EB852     // FSTOP  = 1 MHz
-write 0x30, 50             // RATE: one step per µs (50 cycles @ 50 MHz)
-write 0x2C, 7731           // FDELTA = (FSTOP−FSTART)/10000 steps
-write 0x20, 0x00000001     // SWEEP_CTRL: sawtooth repeat mode
-write 0x04, 0x00002101     // CTRL: EN, sine, SWEEP mode
-write 0x50, 0x00000003     // IRQ_EN: DONE+WRAP
-write 0x1C, 0x00000001     // UPDATE.UPD — commit everything
-read  0x08 until bit4==0   // wait UPD_PENDING clear
-write 0x20, 0x00000101     // START (mode bits unchanged)
-...
-// each lap: IRQ fires, handler does:
-read  0x54                 //   IRQ_STAT, see bit1 (SWEEP_WRAP)
-write 0x54, 0x00000002     //   W1C
+frame: 0x8004, 0x8937, 0x0041      // FWORD = 0x00418937 (100 kHz @ 100 MHz)
+frame: 0x8008, 0x4CCD              // DUTY = 30 %
+frame: 0x8002, 0x1021              // CTRL: EN | OUT12, square, FIXED, offset binary
 ```
 
-### 7.6 FSK driven by another IP block, no CPU in the loop
+### 7.5 Sine on a DC bias, or a pure DC level
 
 ```
-write 0x38, FWORD_space    // PROF0_FWORD
-write 0x3C, FWORD_mark     // PROF1_FWORD
-write 0x34, 0x00000010     // PROF_CTRL: EXT_SEL_EN
-write 0x04, 0x00002201     // CTRL: EN, sine, PROFILE mode
-// wire the data line (e.g. from your SPI/user logic) to hop_sel[0]
+frame: 0x8009, 0x0FA0              // OFFSET = +4000
+frame: 0x8007, 0x4000              // AMP = 0.5  → sine of half amplitude around +4000
+frame: 0x8007, 0x0000              // AMP = 0    → flat DC at +4000
 ```
 
-### 7.7 Load and play a user-defined waveform
+### 7.6 Hardware sweep: 100 kHz → 1 MHz in 10 ms, repeating
 
 ```
-write 0x04, 0x00002000     // EN=0 while loading (optional but glitch-free)
-for n in 0..4095:
-    write 0x4000 + 4*n, sample[n] & 0x3FFF   // 14-bit two's complement
-read  0x4000 + 4*k         // optional readback verify
-write 0x0C, FWORD          // playback rate: RAM sweeps once per output period
-write 0x04, 0x00002051     // CTRL: EN, user wave
+frame: 0x800C, 0x8937, 0x0041      // FSTART = 0x00418937 (100 kHz)
+frame: 0x800E, 0x5C29, 0x028F      // FSTOP  = 0x028F5C29 (1 MHz)
+frame: 0x8010, 0x09AA, 0x0000      // FDELTA = 2474
+frame: 0x8012, 0x0040, 0x0000      // RATE   = 64 cycles/step  → 15625 steps = 10.0 ms
+frame: 0x8002, 0x0101              // CTRL: EN, sine, SWEEP (offset binary)
+frame: 0x800B, 0x0101              // SWEEP_CTRL: SAW | START
 ```
 
-### 7.8 Interrupt-driven update confirmation
+The last frame arms the mode and fires START in one commit. The firmware's
+`dds_sweep_config()` computes FDELTA/RATE for you and lands within 0.05 % of the
+requested duration.
+
+### 7.7 FSK driven by pins, no CPU in the loop
 
 ```
-write 0x50, 0x00000004     // IRQ_EN: UPD_DONE
-write 0x0C, new_fword      // AUTO update
-// on dds_irq: read 0x54, write 0x54 = 0x4 — new frequency is now live
+frame: 0x8015, 0x5C29, 0x028F      // PROF0 = 1 MHz
+frame: 0x8017, 0xB852, 0x051E      // PROF1 = 2 MHz
+frame: 0x8014, 0x0010              // PROF_CTRL: EXT_SEL (follow hop_sel pins)
+frame: 0x8002, 0x0201              // CTRL: EN, sine, PROFILE (offset binary)
 ```
+
+`hop_sel[1:0]` now selects the frequency at the sample rate.
+
+### 7.8 Load and play a user waveform
+
+```
+frame: 0xA000, s0, s1, s2, ...     // WAVE_RAM base, address auto-increments
+frame: 0x8002, 0x0051              // CTRL: EN, WAVE = user, FIXED (offset binary)
+```
+
+Samples are 14-bit two's complement (−8192 … +8191) in the low bits of each
+word. One frame can carry as many samples as you like; the firmware splits the
+4096-entry table into chunks of 33.
+
+### 7.9 Retune two channels at exactly the same instant
+
+```
+frame: 0x800A, 0x0000              // ch0: AUTO = 0
+frame: 0xC00A, 0x0000              // ch1: AUTO = 0     (CMD bit14 = channel 1)
+frame: 0x8004, ...., ....          // ch0: new FWORD into the shadow
+frame: 0xC004, ...., ....          // ch1: new FWORD into the shadow
+frame: 0x800A, 0x0001              // ch0: UPD  → commits
+frame: 0xC00A, 0x0001              // ch1: UPD  → commits
+```
+
+The two commits are still two frames apart (a few µs at 9 MHz SCK). For a
+sample-exact simultaneous change, use PROFILE mode and tie both channels'
+`hop_sel` pins together.
 
 ---
 
@@ -518,78 +573,91 @@ write 0x0C, new_fword      // AUTO update
 
 ### 8.1 File list
 
-| File | Content |
-|---|---|
-| `rtl/dds_top.v`      | Top level (instantiate this) |
-| `rtl/dds_regs.v`     | APB register file, PCLK-side CDC |
-| `rtl/dds_core.v`     | Datapath, sweep engine, dds_clk-side CDC |
-| `rtl/dds_sin_lut.v`  | Quarter-wave sine ROM |
-| `rtl/dds_sin_lut.mem`| ROM init data (regenerate: `scripts/gen_sin_lut.py`) |
-| `rtl/dds_wave_ram.v` | User waveform dual-port RAM |
-| `rtl/dds_cdc.v`      | Toggle-pulse and 2-FF synchronizers |
-| `tb/tb_dds.sv`        | Self-checking testbench |
-| `Doc/AN01_AD9764_Module.md` | Application note for a specific DAC board (board-level topics are kept out of this datasheet) |
-
-Add `dds_sin_lut.mem` to the Vivado project (as a design source or in the
-simulation/synthesis search path), or set the `SIN_LUT_FILE` parameter to an
-absolute path.
-
-### 8.2 Timing constraints (only when PCLK ≠ dds_clk)
-
-The transfer-register buses are quasi-static when sampled (guarded by the
-toggle handshake); constrain them as such and mark the synchronizers:
-
-```tcl
-# synchronizer flops
-set_property ASYNC_REG TRUE [get_cells -hier -regex .*u_sync_.*/sync_reg.*]
-
-# quasi-static config bus: bound skew to one destination period
-set_max_delay -datapath_only \
-  -from [get_cells u_dds/u_regs/t_*_reg*] \
-  -to   [get_cells u_dds/u_core/a_*_reg*] \
-  [get_property PERIOD [get_clocks -of [get_ports dds_clk]]]
+```
+rtl/
+  dds_top.v         top level - instantiate this (SPI + 1..2 channels)
+  dds_spi_slave.v   SPI mode-0 slave, oversampled; drives the internal bus
+  dds_channel.v     one channel: registers + datapath + waveform RAM
+  dds_regs.v        16-bit register file, shadow/commit logic
+  dds_core.v        phase accumulator, sweep engine, waveforms, output stage
+  dds_sin_lut.v     quarter-wave sine ROM (inferred BRAM)
+  dds_sin_lut.mem   ROM init data for $readmemh (add to the Vivado project)
+  dds_wave_ram.v    user waveform dual-port RAM (inferred BRAM)
+tb/
+  tb_dds.sv         self-checking testbench with a bit-accurate SPI master
+scripts/
+  gen_sin_lut.py    regenerates dds_sin_lut.mem
 ```
 
-With PCLK and dds_clk tied to the same PLL output, skip both — everything is
-synchronous.
+### 8.2 Clocking and reset
 
-### 8.3 Resource estimate (7-series)
+- One clock: `dds_clk`. Run it at **100 MHz** (AN01 explains why) from the
+  board's 50 MHz oscillator via PLL/MMCM.
+- The SPI pins are asynchronous inputs and are synchronized inside. The only
+  requirement is `f_sck ≤ dds_clk / 6`.
+- `dds_rstn` is active-low; assert asynchronously, release synchronously to
+  `dds_clk` (standard PLL-locked reset practice).
+- Forward the DAC clock from `dds_clk` with an ODDR primitive so `dac_data` is
+  stable at the DAC's rising edge (AN01 §4).
 
-| Resource | Count | Use |
-|---|---|---|
-| BRAM18 | 4 | sine LUT (4096×13), wave RAM (4096×14) |
-| DSP48  | 1 | amplitude multiplier |
-| LUT/FF | ≈ 600 / ≈ 900 | accumulators, sweep engine, registers |
+### 8.3 Timing constraints
 
-Fmax on Artix-7 (-1): comfortably > 150 MHz on `dds_clk` (longest paths are
-the 32-bit adds, all single-level).
+There is no clock-domain crossing left to constrain — the register file and the
+datapath share `dds_clk`. Just tell the tool the SPI inputs are asynchronous so
+it does not try to time them against a clock that does not exist:
 
-### 8.4 Simulation
+```tcl
+set_false_path -from [get_ports {spi_sck spi_cs_n spi_mosi}]
+set_false_path -to   [get_ports {spi_miso spi_miso_oe}]
+set_false_path -from [get_ports {ch*_sweep_trig ch*_hop_sel[*]}]
+```
+
+The synchronizer flops handle metastability; the protocol tolerates the
+resulting 2–3 cycle latency by design.
+
+### 8.4 Resource estimate (7-series, per channel)
+
+~4 × BRAM18 (sine LUT + wave RAM), 1 × DSP48 (amplitude multiplier), roughly
+600 LUT / 900 FF. The shared SPI slave adds ~80 LUT / 120 FF. Comfortably
+exceeds 150 MHz on Artix-7 speed grade −1.
+
+### 8.5 Simulation
 
 ```
 cd tb
 iverilog -g2012 -o tb_dds.vvp tb_dds.sv ../rtl/*.v
-vvp tb_dds.vvp                          # 26 checks, "ALL TESTS PASSED"
-iverilog -g2012 -DASYNC_CLKS ...        # same suite with 125 MHz async dds_clk
+vvp tb_dds.vvp                    # 47 self-checks -> "ALL TESTS PASSED"
 ```
 
-A VCD (`tb_dds.vcd`) is dumped for waveform inspection.
+Add `-DSCK_FAST` to rerun the whole suite with SCK at the documented
+`dds_clk / 6` limit (16 MHz). A `tb_dds.vcd` waveform dump is produced.
 
 ---
 
 ## 9. Known limitations
 
-- FSTOP < FSTART or FDELTA = 0 in SWEEP mode is not rejected in hardware;
-  the sweep clamps immediately / never advances. Program sane values.
-- WAVE_RAM is uninitialized at power-up.
-- ACTIVE_PROF in STATUS may momentarily tear during a hop (read-only,
-  informational).
-- Exactly 100 % square duty is unreachable (65535/65536 max); for a static
-  level use AMP = 0 with the OFFSET register instead.
+- The sweep engine ramps upward only (`FSTOP > FSTART`). For a downward chirp,
+  use UPDOWN mode and trigger on the reversal, or reprogram FSTART/FSTOP.
+- `hop_sel` and `sweep_trig` are sampled in `dds_clk`, so pin-driven hops carry
+  2–3 cycles of latency (20–30 ns at 100 MHz).
+- The user waveform RAM is a single 4096-entry table per channel; there is no
+  double buffering, so rewriting it during playback is audible.
+- A read frame costs one turnaround word; there is no way to read a register in
+  a two-word frame.
+- Reads return the **shadow** register value, which with `AUTO = 0` may not yet
+  be what the datapath is using.
+- **Channels cannot be started on the same clock edge from SPI.** Two frames
+  commit microseconds apart, so after enabling both channels their accumulators
+  sit a constant `N × FWORD` apart (constant, but not zero, and it scales with
+  FWORD). For a phase-exact I/Q pair, either null the offset once with POW at
+  your operating frequency, or add a sync signal in your wrapper that releases
+  both channels' `dds_rstn` — or both `CTRL.EN`s — on one edge. See AN01 §9.
+
+---
 
 ## 10. Revision history
 
-| Rev | Date | Notes |
-|---|---|---|
-| 1.0 | 2026-07-07 | Initial release. Verified with Icarus Verilog, sync and async clock configurations. |
-| 1.1 | 2026-07-07 | Added OFFSET register (0x58): 14-bit signed DC offset with saturation, applied after the amplitude multiplier. ID reads 0x4453_0110. Testbench rewritten in SystemVerilog, 26 checks. |
+| Version | Change |
+|---|---|
+| 0x0200 | SPI (mode 0, 16-bit) replaces APB. 16-bit register map, dual channel on one chip select, single clock domain, atomic frame commit, AMP moved to Q1.15, SWEEP_RATE widened to 32 bits. |
+| 0x0110 | APB version: 32-bit registers, DC offset, dual-clock CDC. |

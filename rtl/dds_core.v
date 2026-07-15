@@ -5,12 +5,15 @@
 //     -> 32-bit phase accumulator (+ phase offset word)
 //     -> waveform generation (1/4-wave sine LUT, square, triangle,
 //        ramp, user RAM)
-//     -> amplitude multiplier (Q1.16, 0..1.0) + DC offset (saturating)
+//     -> amplitude multiplier (Q1.15, 0..1.0) + DC offset (saturating)
 //     -> output conditioning (14/12-bit, offset-binary / two's complement)
 //
 // Output pipeline latency: 6 dds_clk cycles from phase accumulator to
-// dac_data. All configuration arrives as an atomically captured t_* set,
-// announced by a flip of xfer_tgl.
+// dac_data. Configuration arrives from dds_regs in the same clock domain and
+// is latched as one atomic set on cfg_apply.
+//
+// The only asynchronous inputs are the hardware pacing pins (sweep_trig,
+// hop_sel); they are synchronized here.
 
 module dds_core #(
     parameter SIN_LUT_FILE = "dds_sin_lut.mem"
@@ -18,51 +21,52 @@ module dds_core #(
     input  wire        dds_clk,
     input  wire        dds_rstn,
 
-    // captured configuration from dds_regs (stable across xfer_tgl flips)
-    input  wire [31:0] t_fword,
-    input  wire [15:0] t_pow,
-    input  wire [16:0] t_amp,
-    input  wire [15:0] t_duty,
-    input  wire [13:0] t_offset,
-    input  wire [2:0]  t_wave_sel,
-    input  wire [1:0]  t_freq_mode,
-    input  wire        t_out_width,
-    input  wire        t_out_fmt,
-    input  wire        t_out_inv,
-    input  wire [1:0]  t_sweep_mode,
-    input  wire        t_sweep_ext_trig,
-    input  wire [31:0] t_sweep_fstart,
-    input  wire [31:0] t_sweep_fstop,
-    input  wire [31:0] t_sweep_fdelta,
-    input  wire [23:0] t_sweep_rate,
-    input  wire [1:0]  t_prof_sel,
-    input  wire        t_prof_ext_sel,
-    input  wire [31:0] t_prof_fword0,
-    input  wire [31:0] t_prof_fword1,
-    input  wire [31:0] t_prof_fword2,
-    input  wire [31:0] t_prof_fword3,
-    input  wire [15:0] t_prof_pow0,
-    input  wire [15:0] t_prof_pow1,
-    input  wire [15:0] t_prof_pow2,
-    input  wire [15:0] t_prof_pow3,
+    // configuration from dds_regs (latched on cfg_apply)
+    input  wire [31:0] cfg_fword,
+    input  wire [15:0] cfg_pow,
+    input  wire [15:0] cfg_amp,           // Q1.15, 0x8000 = 1.0
+    input  wire [15:0] cfg_duty,
+    input  wire [13:0] cfg_offset,
+    input  wire [2:0]  cfg_wave_sel,
+    input  wire [1:0]  cfg_freq_mode,
+    input  wire        cfg_out_width,
+    input  wire        cfg_out_fmt,
+    input  wire        cfg_out_inv,
+    input  wire [1:0]  cfg_sweep_mode,
+    input  wire        cfg_sweep_ext_trig,
+    input  wire [31:0] cfg_sweep_fstart,
+    input  wire [31:0] cfg_sweep_fstop,
+    input  wire [31:0] cfg_sweep_fdelta,
+    input  wire [31:0] cfg_sweep_rate,
+    input  wire [1:0]  cfg_prof_sel,
+    input  wire        cfg_prof_ext_sel,
+    input  wire [31:0] cfg_prof_fword0,
+    input  wire [31:0] cfg_prof_fword1,
+    input  wire [31:0] cfg_prof_fword2,
+    input  wire [31:0] cfg_prof_fword3,
+    input  wire [15:0] cfg_prof_pow0,
+    input  wire [15:0] cfg_prof_pow1,
+    input  wire [15:0] cfg_prof_pow2,
+    input  wire [15:0] cfg_prof_pow3,
 
-    input  wire        cfg_en,       // level (PCLK domain, synced here)
-    input  wire        xfer_tgl,
-    input  wire        srst_tgl,
-    input  wire        start_tgl,
-    input  wire        abort_tgl,
-    output reg         upd_ack_tgl,
-    output reg         evt_done_tgl,
-    output reg         evt_wrap_tgl,
+    input  wire        cfg_en,            // CTRL.EN level, immediate
+    input  wire        cfg_apply,         // 1-cycle: latch the config above
+    input  wire        srst_p,            // 1-cycle: soft reset
+    input  wire        start_p,           // 1-cycle: sweep start
+    input  wire        abort_p,           // 1-cycle: sweep abort
+
+    output reg         upd_done_p,        // 1-cycle: config latched
+    output reg         evt_done_p,        // 1-cycle: single sweep finished
+    output reg         evt_wrap_p,        // 1-cycle: sweep wrapped / reversed
     output wire        stat_sweep_active,
     output wire        stat_sweep_dir,
     output wire [1:0]  stat_active_prof,
 
-    // hardware pacing inputs (asynchronous, synced here)
-    input  wire        sweep_trig,
-    input  wire [1:0]  hop_sel,
+    // hardware pacing inputs (asynchronous, synchronized here)
+    input  wire        sweep_trig,        // rising edge starts a sweep
+    input  wire [1:0]  hop_sel,           // profile select (FSK/PSK data)
 
-    // waveform RAM port B
+    // waveform RAM playback port
     output wire [11:0] wave_addr,
     input  wire [13:0] wave_rdata,
 
@@ -76,15 +80,7 @@ localparam [2:0] W_SIN = 3'd0, W_COS = 3'd1, W_SQ  = 3'd2,
 localparam [1:0] M_FIXED = 2'd0, M_SWEEP = 2'd1, M_PROF = 2'd2;
 localparam [1:0] SW_SINGLE = 2'd0, SW_SAW = 2'd1, SW_UPDOWN = 2'd2;
 
-// ---------------------------------------------------------------- CDC in
-wire load_p, srst_p, start_p, abort_p, en_s;
-
-dds_cdc_pulse u_sync_xfer  (.clk(dds_clk), .rstn(dds_rstn), .tgl_in(xfer_tgl),  .pulse(load_p));
-dds_cdc_pulse u_sync_srst  (.clk(dds_clk), .rstn(dds_rstn), .tgl_in(srst_tgl),  .pulse(srst_p));
-dds_cdc_pulse u_sync_start (.clk(dds_clk), .rstn(dds_rstn), .tgl_in(start_tgl), .pulse(start_p));
-dds_cdc_pulse u_sync_abort (.clk(dds_clk), .rstn(dds_rstn), .tgl_in(abort_tgl), .pulse(abort_p));
-dds_cdc_bit   u_sync_en    (.clk(dds_clk), .rstn(dds_rstn), .d(cfg_en),         .q(en_s));
-
+// ----------------------------------------------- async pacing pins -> sync
 // sweep_trig: 2-FF sync + rising edge detect
 reg [2:0] trig_s;
 always @(posedge dds_clk or negedge dds_rstn) begin
@@ -93,7 +89,7 @@ always @(posedge dds_clk or negedge dds_rstn) begin
 end
 wire trig_edge = trig_s[1] & ~trig_s[2];
 
-// hop_sel: 2-FF sync + 2-cycle agreement filter
+// hop_sel: 2-FF sync + 2-cycle agreement filter (the two bits may skew)
 reg [1:0] hs_m, hs_s, hs_prev, hs_stable;
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) begin
@@ -107,58 +103,59 @@ always @(posedge dds_clk or negedge dds_rstn) begin
     end
 end
 
-// ------------------------------------------------------------ active regs
+// ------------------------------------------------------------ active config
 reg [31:0] a_fword, a_fstart, a_fdelta;
 reg [31:0] a_limit;                       // fstop - fstart
-reg [15:0] a_pow, a_duty;
-reg [16:0] a_amp;
+reg [15:0] a_pow, a_duty, a_amp;
 reg signed [13:0] a_offset;
 reg [2:0]  a_wave;
 reg [1:0]  a_mode, a_swmode, a_psel;
 reg        a_ext_trig, a_ext_psel;
-reg [23:0] a_rate;
+reg [31:0] a_rate;
 reg        a_width12, a_fmt2c, a_inv;
-reg [31:0] a_pfw [0:3];
+reg [31:0] a_pfw  [0:3];
 reg [15:0] a_ppow [0:3];
 
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) begin
         a_fword <= 32'h0;   a_fstart <= 32'h0;  a_fdelta <= 32'h0;
         a_limit <= 32'h0;   a_pow <= 16'h0;     a_duty <= 16'h8000;
-        a_amp <= 17'h10000; a_offset <= 14'sd0;
+        a_amp <= 16'h8000;  a_offset <= 14'sd0;
         a_wave <= W_SIN;    a_mode <= M_FIXED;
         a_swmode <= SW_SINGLE; a_psel <= 2'd0;
-        a_ext_trig <= 1'b0; a_ext_psel <= 1'b0; a_rate <= 24'd1;
+        a_ext_trig <= 1'b0; a_ext_psel <= 1'b0; a_rate <= 32'd1;
         a_width12 <= 1'b0;  a_fmt2c <= 1'b0;    a_inv <= 1'b0;
         a_pfw[0] <= 32'h0;  a_pfw[1] <= 32'h0;
         a_pfw[2] <= 32'h0;  a_pfw[3] <= 32'h0;
         a_ppow[0] <= 16'h0; a_ppow[1] <= 16'h0;
         a_ppow[2] <= 16'h0; a_ppow[3] <= 16'h0;
-        upd_ack_tgl <= 1'b0;
-    end else if (load_p) begin
-        a_fword    <= t_fword;
-        a_fstart   <= t_sweep_fstart;
-        a_fdelta   <= t_sweep_fdelta;
-        a_limit    <= t_sweep_fstop - t_sweep_fstart;
-        a_pow      <= t_pow;
-        a_duty     <= t_duty;
-        a_amp      <= t_amp[16] ? 17'h10000 : t_amp;
-        a_offset   <= $signed(t_offset);
-        a_wave     <= t_wave_sel;
-        a_mode     <= t_freq_mode;
-        a_swmode   <= t_sweep_mode;
-        a_psel     <= t_prof_sel;
-        a_ext_trig <= t_sweep_ext_trig;
-        a_ext_psel <= t_prof_ext_sel;
-        a_rate     <= t_sweep_rate;
-        a_width12  <= t_out_width;
-        a_fmt2c    <= t_out_fmt;
-        a_inv      <= t_out_inv;
-        a_pfw[0]   <= t_prof_fword0;  a_pfw[1] <= t_prof_fword1;
-        a_pfw[2]   <= t_prof_fword2;  a_pfw[3] <= t_prof_fword3;
-        a_ppow[0]  <= t_prof_pow0;    a_ppow[1] <= t_prof_pow1;
-        a_ppow[2]  <= t_prof_pow2;    a_ppow[3] <= t_prof_pow3;
-        upd_ack_tgl <= ~upd_ack_tgl;  // ack + UPD_DONE event
+        upd_done_p <= 1'b0;
+    end else begin
+        upd_done_p <= cfg_apply;
+        if (cfg_apply) begin
+            a_fword    <= cfg_fword;
+            a_fstart   <= cfg_sweep_fstart;
+            a_fdelta   <= cfg_sweep_fdelta;
+            a_limit    <= cfg_sweep_fstop - cfg_sweep_fstart;
+            a_pow      <= cfg_pow;
+            a_duty     <= cfg_duty;
+            a_amp      <= cfg_amp;
+            a_offset   <= $signed(cfg_offset);
+            a_wave     <= cfg_wave_sel;
+            a_mode     <= cfg_freq_mode;
+            a_swmode   <= cfg_sweep_mode;
+            a_psel     <= cfg_prof_sel;
+            a_ext_trig <= cfg_sweep_ext_trig;
+            a_ext_psel <= cfg_prof_ext_sel;
+            a_rate     <= (cfg_sweep_rate == 32'd0) ? 32'd1 : cfg_sweep_rate;
+            a_width12  <= cfg_out_width;
+            a_fmt2c    <= cfg_out_fmt;
+            a_inv      <= cfg_out_inv;
+            a_pfw[0]   <= cfg_prof_fword0;  a_pfw[1] <= cfg_prof_fword1;
+            a_pfw[2]   <= cfg_prof_fword2;  a_pfw[3] <= cfg_prof_fword3;
+            a_ppow[0]  <= cfg_prof_pow0;    a_ppow[1] <= cfg_prof_pow1;
+            a_ppow[2]  <= cfg_prof_pow2;    a_ppow[3] <= cfg_prof_pow3;
+        end
     end
 end
 
@@ -168,9 +165,9 @@ end
 // accumulator input is a_fstart + freq_off.
 reg         sweep_act, sweep_dir;      // dir: 0 = up, 1 = down
 reg  [31:0] freq_off;
-reg  [23:0] rate_cnt;
+reg  [31:0] rate_cnt;
 
-wire        rate_hit  = (rate_cnt + 24'd1 >= a_rate);
+wire        rate_hit  = (rate_cnt + 32'd1 >= a_rate);
 wire [32:0] off_up    = {1'b0, freq_off} + {1'b0, a_fdelta};
 wire        hit_top   = (off_up >= {1'b0, a_limit});
 wire        hit_bot   = (freq_off <= a_fdelta);
@@ -179,52 +176,57 @@ wire        start_evt = (a_ext_trig ? trig_edge : start_p) && (a_mode == M_SWEEP
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) begin
         sweep_act <= 1'b0;  sweep_dir <= 1'b0;
-        freq_off  <= 32'h0; rate_cnt  <= 24'd0;
-        evt_done_tgl <= 1'b0;  evt_wrap_tgl <= 1'b0;
-    end else if (srst_p || (a_mode != M_SWEEP)) begin
-        sweep_act <= 1'b0;  sweep_dir <= 1'b0;
-        freq_off  <= 32'h0; rate_cnt  <= 24'd0;
-    end else if (start_evt) begin
-        sweep_act <= 1'b1;  sweep_dir <= 1'b0;
-        freq_off  <= 32'h0; rate_cnt  <= 24'd0;
-    end else if (abort_p) begin
-        sweep_act <= 1'b0;  sweep_dir <= 1'b0;
-        freq_off  <= 32'h0; rate_cnt  <= 24'd0;
-    end else if (sweep_act && en_s) begin
-        if (rate_hit) begin
-            rate_cnt <= 24'd0;
-            if (!sweep_dir) begin                       // sweeping up
-                if (hit_top) begin
-                    case (a_swmode)
-                        SW_SAW: begin
-                            freq_off     <= 32'h0;      // restart from FSTART
-                            evt_wrap_tgl <= ~evt_wrap_tgl;
-                        end
-                        SW_UPDOWN: begin
-                            freq_off     <= a_limit;
-                            sweep_dir    <= 1'b1;
-                            evt_wrap_tgl <= ~evt_wrap_tgl;
-                        end
-                        default: begin                  // SW_SINGLE: hold FSTOP
-                            freq_off     <= a_limit;
-                            sweep_act    <= 1'b0;
-                            evt_done_tgl <= ~evt_done_tgl;
-                        end
-                    endcase
-                end else begin
-                    freq_off <= off_up[31:0];
+        freq_off  <= 32'h0; rate_cnt  <= 32'd0;
+        evt_done_p <= 1'b0; evt_wrap_p <= 1'b0;
+    end else begin
+        evt_done_p <= 1'b0;
+        evt_wrap_p <= 1'b0;
+
+        if (srst_p || (a_mode != M_SWEEP)) begin
+            sweep_act <= 1'b0;  sweep_dir <= 1'b0;
+            freq_off  <= 32'h0; rate_cnt  <= 32'd0;
+        end else if (start_evt) begin
+            sweep_act <= 1'b1;  sweep_dir <= 1'b0;
+            freq_off  <= 32'h0; rate_cnt  <= 32'd0;
+        end else if (abort_p) begin
+            sweep_act <= 1'b0;  sweep_dir <= 1'b0;
+            freq_off  <= 32'h0; rate_cnt  <= 32'd0;
+        end else if (sweep_act && cfg_en) begin
+            if (rate_hit) begin
+                rate_cnt <= 32'd0;
+                if (!sweep_dir) begin                       // sweeping up
+                    if (hit_top) begin
+                        case (a_swmode)
+                            SW_SAW: begin
+                                freq_off   <= 32'h0;        // restart at FSTART
+                                evt_wrap_p <= 1'b1;
+                            end
+                            SW_UPDOWN: begin
+                                freq_off   <= a_limit;
+                                sweep_dir  <= 1'b1;
+                                evt_wrap_p <= 1'b1;
+                            end
+                            default: begin                  // SW_SINGLE: hold FSTOP
+                                freq_off   <= a_limit;
+                                sweep_act  <= 1'b0;
+                                evt_done_p <= 1'b1;
+                            end
+                        endcase
+                    end else begin
+                        freq_off <= off_up[31:0];
+                    end
+                end else begin                              // sweeping down
+                    if (hit_bot) begin
+                        freq_off   <= 32'h0;
+                        sweep_dir  <= 1'b0;
+                        evt_wrap_p <= 1'b1;
+                    end else begin
+                        freq_off <= freq_off - a_fdelta;
+                    end
                 end
-            end else begin                              // sweeping down
-                if (hit_bot) begin
-                    freq_off     <= 32'h0;
-                    sweep_dir    <= 1'b0;
-                    evt_wrap_tgl <= ~evt_wrap_tgl;
-                end else begin
-                    freq_off <= freq_off - a_fdelta;
-                end
+            end else begin
+                rate_cnt <= rate_cnt + 32'd1;
             end
-        end else begin
-            rate_cnt <= rate_cnt + 24'd1;
         end
     end
 end
@@ -263,16 +265,16 @@ assign stat_active_prof = act_prof;
 // s0: phase accumulator
 reg [31:0] phase;
 always @(posedge dds_clk or negedge dds_rstn) begin
-    if (!dds_rstn)   phase <= 32'h0;
-    else if (srst_p) phase <= 32'h0;
-    else if (en_s)   phase <= phase + eff_fword;
+    if (!dds_rstn)     phase <= 32'h0;
+    else if (srst_p)   phase <= 32'h0;
+    else if (cfg_en)   phase <= phase + eff_fword;
 end
 
 // s1: apply phase offset
 reg [31:0] ph1;
 always @(posedge dds_clk or negedge dds_rstn) begin
-    if (!dds_rstn) ph1 <= 32'h0;
-    else if (en_s) ph1 <= phase + {eff_pow, 16'h0000};
+    if (!dds_rstn)    ph1 <= 32'h0;
+    else if (cfg_en)  ph1 <= phase + {eff_pow, 16'h0000};
 end
 
 // s2: sine LUT read (quarter-wave: quadrant = ph1[31:30], addr = ph1[29:18])
@@ -282,7 +284,7 @@ wire [12:0] lut_q;
 
 dds_sin_lut #(.MEM_FILE(SIN_LUT_FILE)) u_sin_lut (
     .clk  (dds_clk),
-    .en   (en_s),
+    .en   (cfg_en),
     .addr (lut_addr),
     .dout (lut_q)
 );
@@ -297,7 +299,7 @@ always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) begin
         sign2 <= 1'b0;
         sq2 <= 14'sd0; tri2 <= 14'sd0; rmp2 <= 14'sd0;
-    end else if (en_s) begin
+    end else if (cfg_en) begin
         sign2 <= ph1[31];
         sq2   <= (ph1[31:16] < a_duty) ? 14'sd8191 : -14'sd8191;
         tri2  <= {~tri_fold[13], tri_fold[12:0]};            // unsigned - 8192
@@ -322,25 +324,25 @@ always @(*) begin
 end
 
 always @(posedge dds_clk or negedge dds_rstn) begin
-    if (!dds_rstn)  smp3 <= 14'sd0;
-    else if (en_s)  smp3 <= wave_mux;
+    if (!dds_rstn)    smp3 <= 14'sd0;
+    else if (cfg_en)  smp3 <= wave_mux;
 end
 
-// s4: amplitude multiply, sample(14s) x amp(Q1.16) -> Q1.16 product
-reg signed [31:0] prod4;
+// s4: amplitude multiply, sample(14s) x amp(Q1.15) -> 31-bit product
+reg signed [30:0] prod4;
 always @(posedge dds_clk or negedge dds_rstn) begin
-    if (!dds_rstn)  prod4 <= 32'sd0;
-    else if (en_s)  prod4 <= smp3 * $signed({1'b0, a_amp});
+    if (!dds_rstn)    prod4 <= 31'sd0;
+    else if (cfg_en)  prod4 <= smp3 * $signed({1'b0, a_amp});
 end
 
 // s5: round to nearest, add DC offset, saturate to 14-bit signed.
 // Worst case |rnd5 + offset| = 8192 + 8192 fits in 16-bit signed.
-wire signed [15:0] rnd5 = (prod4 + 32'sd32768) >>> 16;
+wire signed [15:0] rnd5 = (prod4 + 31'sd16384) >>> 15;
 wire signed [15:0] ofs5 = rnd5 + a_offset;
 reg  signed [13:0] samp5;
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) samp5 <= 14'sd0;
-    else if (en_s) begin
+    else if (cfg_en) begin
         if      (ofs5 >  16'sd8191) samp5 <=  14'sd8191;
         else if (ofs5 < -16'sd8192) samp5 <= -14'sd8192;
         else                        samp5 <= ofs5[13:0];
@@ -359,7 +361,7 @@ wire        [13:0] w_mid = a_fmt2c ? 14'h0000 : 14'h2000;          // mid-scale
 reg [5:0] en_dly;
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) en_dly <= 6'b0;
-    else           en_dly <= {en_dly[4:0], en_s};
+    else           en_dly <= {en_dly[4:0], cfg_en};
 end
 
 always @(posedge dds_clk or negedge dds_rstn) begin

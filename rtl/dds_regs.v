@@ -1,410 +1,353 @@
-// dds_regs.v - APB register file for the DDS core (PCLK domain)
+// dds_regs.v - 16-bit register file for one DDS channel
 //
-// APB style aligned with spi_regs.v (PSEL/PENABLE/PWRITE, PREADY tied high),
-// widened to 32-bit data. PADDR is a byte address; registers decode on
-// PADDR[7:2], the waveform RAM occupies the 16 KB window selected by
-// PADDR[14] (0x4000..0x7FFF).
+// Sits on the internal bus produced by dds_spi_slave, in the dds_clk domain
+// (the SPI pins are oversampled, so the whole IP is single-clock).
 //
-// All datapath parameters are double-buffered:
-//   shadow regs (APB writes)  --capture-->  t_* transfer regs  --xfer_tgl-->
-//   active regs in dds_core (dds_clk domain), loaded atomically.
-// With UPDATE.AUTO=1 (reset default) every config write triggers a capture;
-// with AUTO=0 writes accumulate in the shadows until UPDATE.UPD is written.
+// Word address map (see Doc/DDS_Datasheet.md for the bit fields):
+//   0x00 ID (RO)      0x08 DUTY          0x10 SWEEP_FDELTA_L  0x18 PROF2_FWORD_L
+//   0x01 VERSION (RO) 0x09 OFFSET        0x11 SWEEP_FDELTA_H  0x19 PROF2_FWORD_H
+//   0x02 CTRL         0x0A UPDATE        0x12 SWEEP_RATE_L    0x1A PROF3_FWORD_L
+//   0x03 STATUS (RO)  0x0B SWEEP_CTRL    0x13 SWEEP_RATE_H    0x1B PROF3_FWORD_H
+//   0x04 FWORD_L      0x0C SWEEP_FSTART_L 0x14 PROF_CTRL      0x1C PROF0_POW
+//   0x05 FWORD_H      0x0D SWEEP_FSTART_H 0x15 PROF0_FWORD_L  0x1D PROF1_POW
+//   0x06 POW          0x0E SWEEP_FSTOP_L  0x16 PROF0_FWORD_H  0x1E PROF2_POW
+//   0x07 AMP          0x0F SWEEP_FSTOP_H  0x17 PROF1_FWORD_L  0x1F PROF3_POW
+//   0x20 IRQ_EN       0x21 IRQ_STAT
+//   0x2000..0x2FFF    user waveform RAM (14-bit samples)
+//
+// Everything a frame writes takes effect together: config writes land in
+// shadow registers, and the CS rising edge (bus_frame_end) commits them to
+// the datapath with a single cfg_apply pulse. A 32-bit frequency word written
+// as two 16-bit halves therefore never produces an intermediate frequency.
+// UPDATE.AUTO = 1 (reset default) commits every frame that wrote config;
+// with AUTO = 0 the shadows accumulate across frames until a frame writes
+// UPDATE.UPD = 1. Sweep start/abort and soft reset are likewise deferred to
+// the commit point, so "write sweep config + START" in one frame always
+// starts the sweep with the config from that same frame.
 
 module dds_regs (
-    // APB
-    input  wire        PCLK,
-    input  wire        PRESETn,
+    input  wire        clk,
+    input  wire        rstn,
 
-    input  wire [14:0] PADDR,
-    input  wire        PSEL,
-    input  wire        PENABLE,
-    input  wire        PWRITE,
-    input  wire [31:0] PWDATA,
-    output reg  [31:0] PRDATA,
-    output wire        PREADY,
+    // internal bus (from dds_spi_slave, already channel-decoded)
+    input  wire [13:0] bus_addr,
+    input  wire [15:0] bus_wdata,
+    input  wire        bus_we,
+    input  wire        bus_frame_end,
+    output reg  [15:0] bus_rdata,
 
-    // captured configuration -> dds_core (quasi-static across xfer_tgl)
-    output reg  [31:0] t_fword,
-    output reg  [15:0] t_pow,
-    output reg  [16:0] t_amp,
-    output reg  [15:0] t_duty,
-    output reg  [13:0] t_offset,
-    output reg  [2:0]  t_wave_sel,
-    output reg  [1:0]  t_freq_mode,
-    output reg         t_out_width,
-    output reg         t_out_fmt,
-    output reg         t_out_inv,
-    output reg  [1:0]  t_sweep_mode,
-    output reg         t_sweep_ext_trig,
-    output reg  [31:0] t_sweep_fstart,
-    output reg  [31:0] t_sweep_fstop,
-    output reg  [31:0] t_sweep_fdelta,
-    output reg  [23:0] t_sweep_rate,
-    output reg  [1:0]  t_prof_sel,
-    output reg         t_prof_ext_sel,
-    output reg  [31:0] t_prof_fword0,
-    output reg  [31:0] t_prof_fword1,
-    output reg  [31:0] t_prof_fword2,
-    output reg  [31:0] t_prof_fword3,
-    output reg  [15:0] t_prof_pow0,
-    output reg  [15:0] t_prof_pow1,
-    output reg  [15:0] t_prof_pow2,
-    output reg  [15:0] t_prof_pow3,
+    // configuration -> dds_core (quasi-static, sampled on cfg_apply)
+    output wire [31:0] cfg_fword,
+    output wire [15:0] cfg_pow,
+    output wire [15:0] cfg_amp,          // Q1.15, 0x8000 = 1.0
+    output wire [15:0] cfg_duty,
+    output wire [13:0] cfg_offset,       // signed
+    output wire [2:0]  cfg_wave_sel,
+    output wire [1:0]  cfg_freq_mode,
+    output wire        cfg_out_width,    // 1 = 12-bit MSB-aligned
+    output wire        cfg_out_fmt,      // 1 = two's complement, 0 = offset binary
+    output wire        cfg_out_inv,
+    output wire [1:0]  cfg_sweep_mode,
+    output wire        cfg_sweep_ext_trig,
+    output wire [31:0] cfg_sweep_fstart,
+    output wire [31:0] cfg_sweep_fstop,
+    output wire [31:0] cfg_sweep_fdelta,
+    output wire [31:0] cfg_sweep_rate,
+    output wire [1:0]  cfg_prof_sel,
+    output wire        cfg_prof_ext_sel,
+    output wire [31:0] cfg_prof_fword0,
+    output wire [31:0] cfg_prof_fword1,
+    output wire [31:0] cfg_prof_fword2,
+    output wire [31:0] cfg_prof_fword3,
+    output wire [15:0] cfg_prof_pow0,
+    output wire [15:0] cfg_prof_pow1,
+    output wire [15:0] cfg_prof_pow2,
+    output wire [15:0] cfg_prof_pow3,
 
-    output wire        cfg_en,       // CTRL.EN, immediate level
-    output reg         xfer_tgl,     // flips when t_* set is valid
-    output reg         srst_tgl,     // soft reset event
-    output reg         start_tgl,    // sweep start event
-    output reg         abort_tgl,    // sweep abort event
+    output wire        cfg_en,           // CTRL.EN, immediate level
+    output reg         cfg_apply,        // 1-cycle: load the config into the core
+    output reg         srst_p,           // 1-cycle: soft reset
+    output reg         start_p,          // 1-cycle: sweep start
+    output reg         abort_p,          // 1-cycle: sweep abort
 
-    // from dds_core (dds_clk domain)
-    input  wire        upd_ack_tgl,      // flips when core loaded the t_* set
-    input  wire        evt_done_tgl,     // flips on single-sweep completion
-    input  wire        evt_wrap_tgl,     // flips on sweep wrap / reversal
+    // from dds_core (same clock domain)
+    input  wire        upd_done_p,
+    input  wire        evt_done_p,
+    input  wire        evt_wrap_p,
     input  wire        stat_sweep_active,
     input  wire        stat_sweep_dir,
     input  wire [1:0]  stat_active_prof,
 
     // waveform RAM port A
-    output wire        ram_en,
     output wire        ram_we,
     output wire [11:0] ram_addr,
     output wire [13:0] ram_wdata,
     input  wire [13:0] ram_rdata,
 
-    // Interrupt Request
     output wire        dds_irq
 );
 
-localparam VERSION = 32'h4453_0110;   // "DS" + v1.1.0
+localparam [15:0] ID_CODE = 16'h4453;   // "DS"
+localparam [15:0] VERSION = 16'h0200;   // v2.0 - SPI
 
-// word index of each register (byte offset / 4)
-localparam A_ID           = 6'd0,   // 0x00
-           A_CTRL         = 6'd1,   // 0x04
-           A_STATUS       = 6'd2,   // 0x08
-           A_FWORD        = 6'd3,   // 0x0C
-           A_POW          = 6'd4,   // 0x10
-           A_AMP          = 6'd5,   // 0x14
-           A_DUTY         = 6'd6,   // 0x18
-           A_UPDATE       = 6'd7,   // 0x1C
-           A_SWEEP_CTRL   = 6'd8,   // 0x20
-           A_SWEEP_FSTART = 6'd9,   // 0x24
-           A_SWEEP_FSTOP  = 6'd10,  // 0x28
-           A_SWEEP_FDELTA = 6'd11,  // 0x2C
-           A_SWEEP_RATE   = 6'd12,  // 0x30
-           A_PROF_CTRL    = 6'd13,  // 0x34
-           A_PROF0_FWORD  = 6'd14,  // 0x38
-           A_PROF1_FWORD  = 6'd15,  // 0x3C
-           A_PROF2_FWORD  = 6'd16,  // 0x40
-           A_PROF3_FWORD  = 6'd17,  // 0x44
-           A_PROF_POW10   = 6'd18,  // 0x48
-           A_PROF_POW32   = 6'd19,  // 0x4C
-           A_IRQ_EN       = 6'd20,  // 0x50
-           A_IRQ_STAT     = 6'd21,  // 0x54
-           A_OFFSET       = 6'd22;  // 0x58
+localparam A_ID        = 6'h00, A_VER       = 6'h01, A_CTRL      = 6'h02,
+           A_STATUS    = 6'h03, A_FWORD_L   = 6'h04, A_FWORD_H   = 6'h05,
+           A_POW       = 6'h06, A_AMP       = 6'h07, A_DUTY      = 6'h08,
+           A_OFFSET    = 6'h09, A_UPDATE    = 6'h0A, A_SWCTRL    = 6'h0B,
+           A_FSTART_L  = 6'h0C, A_FSTART_H  = 6'h0D, A_FSTOP_L   = 6'h0E,
+           A_FSTOP_H   = 6'h0F, A_FDELTA_L  = 6'h10, A_FDELTA_H  = 6'h11,
+           A_RATE_L    = 6'h12, A_RATE_H    = 6'h13, A_PROF_CTRL = 6'h14,
+           A_P0F_L     = 6'h15, A_P0F_H     = 6'h16, A_P1F_L     = 6'h17,
+           A_P1F_H     = 6'h18, A_P2F_L     = 6'h19, A_P2F_H     = 6'h1A,
+           A_P3F_L     = 6'h1B, A_P3F_H     = 6'h1C, A_P0POW     = 6'h1D,
+           A_P1POW     = 6'h1E, A_P2POW     = 6'h1F, A_P3POW     = 6'h20,
+           A_IRQ_EN    = 6'h21, A_IRQ_STAT  = 6'h22;
 
-// APB Signals
-wire        APB_access   = PSEL && PENABLE;
-wire        APB_write_en = APB_access && PWRITE;
-wire        APB_read_en  = APB_access && !PWRITE;
-wire        ram_sel      = PADDR[14];
-wire [5:0]  widx         = PADDR[7:2];
-assign      PREADY       = 1'b1;
+wire       ram_sel = bus_addr[13];
+wire [5:0] widx    = bus_addr[5:0];
+wire       reg_we  = bus_we && !ram_sel;
+wire       reg_hit = reg_we && (bus_addr[12:6] == 7'h0);   // no aliasing
 
-// Shadow Regs
-reg         reg_en;
-reg  [2:0]  reg_wave_sel;
-reg  [1:0]  reg_freq_mode;
-reg         reg_out_width, reg_out_fmt, reg_out_inv;
-reg  [31:0] reg_fword;
-reg  [15:0] reg_pow;
-reg  [16:0] reg_amp;
-reg  [15:0] reg_duty;
-reg  [13:0] reg_offset;
-reg         reg_auto;
-reg  [1:0]  reg_sweep_mode;
-reg         reg_sweep_ext_trig;
-reg  [31:0] reg_sweep_fstart, reg_sweep_fstop, reg_sweep_fdelta;
-reg  [23:0] reg_sweep_rate;
-reg  [1:0]  reg_prof_sel;
-reg         reg_prof_ext_sel;
-reg  [31:0] reg_prof_fword [0:3];
-reg  [15:0] reg_prof_pow   [0:3];
-reg  [2:0]  reg_irq_en;
-reg  [2:0]  reg_irq_stat;
+// ---------------------------------------------------------- shadow registers
+reg        s_en;
+reg [2:0]  s_wave;
+reg [1:0]  s_fmode;
+reg        s_w12, s_fmt2c, s_inv;
+reg [31:0] s_fword;
+reg [15:0] s_pow, s_amp, s_duty;
+reg [13:0] s_offset;
+reg        s_auto;
+reg [1:0]  s_swmode;
+reg        s_sw_ext;
+reg [31:0] s_fstart, s_fstop, s_fdelta, s_rate;
+reg [1:0]  s_psel;
+reg        s_pext;
+reg [31:0] s_pfw  [0:3];
+reg [15:0] s_ppow [0:3];
+reg [2:0]  s_irq_en, s_irq_stat;
 
-assign cfg_en = reg_en;
+assign cfg_en             = s_en;
+assign cfg_fword          = s_fword;
+assign cfg_pow            = s_pow;
+assign cfg_amp            = s_amp;
+assign cfg_duty           = s_duty;
+assign cfg_offset         = s_offset;
+assign cfg_wave_sel       = s_wave;
+assign cfg_freq_mode      = s_fmode;
+assign cfg_out_width      = s_w12;
+assign cfg_out_fmt        = s_fmt2c;
+assign cfg_out_inv        = s_inv;
+assign cfg_sweep_mode     = s_swmode;
+assign cfg_sweep_ext_trig = s_sw_ext;
+assign cfg_sweep_fstart   = s_fstart;
+assign cfg_sweep_fstop    = s_fstop;
+assign cfg_sweep_fdelta   = s_fdelta;
+assign cfg_sweep_rate     = s_rate;
+assign cfg_prof_sel       = s_psel;
+assign cfg_prof_ext_sel   = s_pext;
+assign cfg_prof_fword0    = s_pfw[0];
+assign cfg_prof_fword1    = s_pfw[1];
+assign cfg_prof_fword2    = s_pfw[2];
+assign cfg_prof_fword3    = s_pfw[3];
+assign cfg_prof_pow0      = s_ppow[0];
+assign cfg_prof_pow1      = s_ppow[1];
+assign cfg_prof_pow2      = s_ppow[2];
+assign cfg_prof_pow3      = s_ppow[3];
 
-// a write to any register whose content travels through the t_* capture
-wire cfg_write = APB_write_en && !ram_sel &&
-                 ((widx == A_CTRL)  || (widx == A_FWORD) || (widx == A_POW)  ||
-                  (widx == A_AMP)   || (widx == A_DUTY)  || (widx == A_OFFSET) ||
-                  ((widx >= A_SWEEP_CTRL) && (widx <= A_PROF_POW32)));
+// a write to any register whose content the core latches on cfg_apply
+wire cfg_write = reg_hit &&
+                 ((widx == A_CTRL) || (widx == A_FWORD_L) || (widx == A_FWORD_H) ||
+                  (widx == A_POW)  || (widx == A_AMP)     || (widx == A_DUTY)    ||
+                  (widx == A_OFFSET) ||
+                  ((widx >= A_SWCTRL) && (widx <= A_P3POW)));
 
-wire upd_write   = APB_write_en && !ram_sel && (widx == A_UPDATE) && PWDATA[0];
-wire srst_write  = APB_write_en && !ram_sel && (widx == A_CTRL)       && PWDATA[1];
-wire start_write = APB_write_en && !ram_sel && (widx == A_SWEEP_CTRL) && PWDATA[8];
-wire abort_write = APB_write_en && !ram_sel && (widx == A_SWEEP_CTRL) && PWDATA[9];
+wire upd_write   = reg_hit && (widx == A_UPDATE) && bus_wdata[0];
+wire srst_write  = reg_hit && (widx == A_CTRL)   && bus_wdata[1];
+wire start_write = reg_hit && (widx == A_SWCTRL) && bus_wdata[8];
+wire abort_write = reg_hit && (widx == A_SWCTRL) && bus_wdata[9];
 
-// APB Write Data (shadow registers)
-always @(posedge PCLK or negedge PRESETn) begin
-    if (!PRESETn) begin
-        reg_en             <= 1'b0;
-        reg_wave_sel       <= 3'd0;
-        reg_freq_mode      <= 2'd0;
-        reg_out_width      <= 1'b0;
-        reg_out_fmt        <= 1'b0;
-        reg_out_inv        <= 1'b0;
-        reg_fword          <= 32'h0;
-        reg_pow            <= 16'h0;
-        reg_amp            <= 17'h10000;    // 1.0
-        reg_duty           <= 16'h8000;     // 50%
-        reg_offset         <= 14'h0;
-        reg_auto           <= 1'b1;
-        reg_sweep_mode     <= 2'd0;
-        reg_sweep_ext_trig <= 1'b0;
-        reg_sweep_fstart   <= 32'h0;
-        reg_sweep_fstop    <= 32'h0;
-        reg_sweep_fdelta   <= 32'h0;
-        reg_sweep_rate     <= 24'd1;
-        reg_prof_sel       <= 2'd0;
-        reg_prof_ext_sel   <= 1'b0;
-        reg_prof_fword[0]  <= 32'h0;
-        reg_prof_fword[1]  <= 32'h0;
-        reg_prof_fword[2]  <= 32'h0;
-        reg_prof_fword[3]  <= 32'h0;
-        reg_prof_pow[0]    <= 16'h0;
-        reg_prof_pow[1]    <= 16'h0;
-        reg_prof_pow[2]    <= 16'h0;
-        reg_prof_pow[3]    <= 16'h0;
-        reg_irq_en         <= 3'b000;
-    end else begin
-        if (APB_write_en && !ram_sel) begin
-            case (widx)
-                A_CTRL: begin
-                    reg_en        <= PWDATA[0];
-                    reg_wave_sel  <= PWDATA[6:4];
-                    reg_freq_mode <= PWDATA[9:8];
-                    reg_out_width <= PWDATA[12];
-                    reg_out_fmt   <= PWDATA[13];
-                    reg_out_inv   <= PWDATA[14];
-                end
-                A_FWORD:        reg_fword <= PWDATA;
-                A_POW:          reg_pow   <= PWDATA[15:0];
-                A_AMP:          reg_amp   <= PWDATA[16] ? 17'h10000 : PWDATA[16:0];
-                A_DUTY:         reg_duty  <= PWDATA[15:0];
-                A_OFFSET:       reg_offset <= PWDATA[13:0];
-                A_UPDATE:       reg_auto  <= PWDATA[1];
-                A_SWEEP_CTRL: begin
-                    reg_sweep_mode     <= PWDATA[1:0];
-                    reg_sweep_ext_trig <= PWDATA[2];
-                end
-                A_SWEEP_FSTART: reg_sweep_fstart <= PWDATA;
-                A_SWEEP_FSTOP:  reg_sweep_fstop  <= PWDATA;
-                A_SWEEP_FDELTA: reg_sweep_fdelta <= PWDATA;
-                A_SWEEP_RATE:   reg_sweep_rate   <= PWDATA[23:0];
-                A_PROF_CTRL: begin
-                    reg_prof_sel     <= PWDATA[1:0];
-                    reg_prof_ext_sel <= PWDATA[4];
-                end
-                A_PROF0_FWORD:  reg_prof_fword[0] <= PWDATA;
-                A_PROF1_FWORD:  reg_prof_fword[1] <= PWDATA;
-                A_PROF2_FWORD:  reg_prof_fword[2] <= PWDATA;
-                A_PROF3_FWORD:  reg_prof_fword[3] <= PWDATA;
-                A_PROF_POW10: begin
-                    reg_prof_pow[0] <= PWDATA[15:0];
-                    reg_prof_pow[1] <= PWDATA[31:16];
-                end
-                A_PROF_POW32: begin
-                    reg_prof_pow[2] <= PWDATA[15:0];
-                    reg_prof_pow[3] <= PWDATA[31:16];
-                end
-                A_IRQ_EN:       reg_irq_en <= PWDATA[2:0];
-                default: ;
-            endcase
+integer i;
+always @(posedge clk or negedge rstn) begin
+    if (!rstn) begin
+        s_en     <= 1'b0;      s_wave   <= 3'd0;      s_fmode  <= 2'd0;
+        s_w12    <= 1'b0;      s_fmt2c  <= 1'b0;      s_inv    <= 1'b0;
+        s_fword  <= 32'h0;     s_pow    <= 16'h0;
+        s_amp    <= 16'h8000;  s_duty   <= 16'h8000;  s_offset <= 14'h0;
+        s_auto   <= 1'b1;
+        s_swmode <= 2'd0;      s_sw_ext <= 1'b0;
+        s_fstart <= 32'h0;     s_fstop  <= 32'h0;
+        s_fdelta <= 32'h0;     s_rate   <= 32'd1;
+        s_psel   <= 2'd0;      s_pext   <= 1'b0;
+        s_irq_en <= 3'b000;
+        for (i = 0; i < 4; i = i + 1) begin
+            s_pfw[i]  <= 32'h0;
+            s_ppow[i] <= 16'h0;
         end
-    end
-end
-
-// Update / capture handshake
-//   upd_req -> capture one cycle later (so a config write in the same cycle
-//   is included) -> xfer_tgl flips -> core loads and flips upd_ack_tgl back.
-//   A request while busy is remembered (rerun) and served after the ack.
-wire upd_req = upd_write || (reg_auto && cfg_write);
-wire ack_p;
-reg  busy, rerun, cap_now;
-
-dds_cdc_pulse u_sync_ack (.clk(PCLK), .rstn(PRESETn), .tgl_in(upd_ack_tgl), .pulse(ack_p));
-
-always @(posedge PCLK or negedge PRESETn) begin
-    if (!PRESETn) begin
-        busy    <= 1'b0;
-        rerun   <= 1'b0;
-        cap_now <= 1'b0;
-        xfer_tgl <= 1'b0;
-        t_fword <= 32'h0;         t_pow  <= 16'h0;
-        t_amp   <= 17'h10000;     t_duty <= 16'h8000;
-        t_offset <= 14'h0;
-        t_wave_sel <= 3'd0;       t_freq_mode <= 2'd0;
-        t_out_width <= 1'b0;      t_out_fmt <= 1'b0;      t_out_inv <= 1'b0;
-        t_sweep_mode <= 2'd0;     t_sweep_ext_trig <= 1'b0;
-        t_sweep_fstart <= 32'h0;  t_sweep_fstop <= 32'h0;
-        t_sweep_fdelta <= 32'h0;  t_sweep_rate <= 24'd1;
-        t_prof_sel <= 2'd0;       t_prof_ext_sel <= 1'b0;
-        t_prof_fword0 <= 32'h0;   t_prof_fword1 <= 32'h0;
-        t_prof_fword2 <= 32'h0;   t_prof_fword3 <= 32'h0;
-        t_prof_pow0 <= 16'h0;     t_prof_pow1 <= 16'h0;
-        t_prof_pow2 <= 16'h0;     t_prof_pow3 <= 16'h0;
-    end else begin
-        cap_now <= 1'b0;
-
-        if (upd_req) begin
-            if (!busy) begin
-                busy    <= 1'b1;
-                cap_now <= 1'b1;
-            end else begin
-                rerun <= 1'b1;
+    end else if (reg_hit) begin
+        case (widx)
+            A_CTRL: begin
+                s_en    <= bus_wdata[0];
+                s_wave  <= bus_wdata[6:4];
+                s_fmode <= bus_wdata[9:8];
+                s_w12   <= bus_wdata[12];
+                s_fmt2c <= bus_wdata[13];
+                s_inv   <= bus_wdata[14];
             end
-        end
-
-        if (ack_p) begin
-            if (rerun) begin
-                rerun   <= 1'b0;
-                cap_now <= 1'b1;
-            end else begin
-                busy <= 1'b0;
+            A_FWORD_L:  s_fword[15:0]  <= bus_wdata;
+            A_FWORD_H:  s_fword[31:16] <= bus_wdata;
+            A_POW:      s_pow    <= bus_wdata;
+            // gain is clamped to 1.0; anything above full scale would only clip
+            A_AMP:      s_amp    <= (bus_wdata > 16'h8000) ? 16'h8000 : bus_wdata;
+            A_DUTY:     s_duty   <= bus_wdata;
+            A_OFFSET:   s_offset <= bus_wdata[13:0];
+            A_UPDATE:   s_auto   <= bus_wdata[1];
+            A_SWCTRL: begin
+                s_swmode <= bus_wdata[1:0];
+                s_sw_ext <= bus_wdata[2];
             end
-        end
-
-        if (cap_now) begin
-            t_fword          <= reg_fword;
-            t_pow            <= reg_pow;
-            t_amp            <= reg_amp;
-            t_duty           <= reg_duty;
-            t_offset         <= reg_offset;
-            t_wave_sel       <= reg_wave_sel;
-            t_freq_mode      <= reg_freq_mode;
-            t_out_width      <= reg_out_width;
-            t_out_fmt        <= reg_out_fmt;
-            t_out_inv        <= reg_out_inv;
-            t_sweep_mode     <= reg_sweep_mode;
-            t_sweep_ext_trig <= reg_sweep_ext_trig;
-            t_sweep_fstart   <= reg_sweep_fstart;
-            t_sweep_fstop    <= reg_sweep_fstop;
-            t_sweep_fdelta   <= reg_sweep_fdelta;
-            t_sweep_rate     <= reg_sweep_rate;
-            t_prof_sel       <= reg_prof_sel;
-            t_prof_ext_sel   <= reg_prof_ext_sel;
-            t_prof_fword0    <= reg_prof_fword[0];
-            t_prof_fword1    <= reg_prof_fword[1];
-            t_prof_fword2    <= reg_prof_fword[2];
-            t_prof_fword3    <= reg_prof_fword[3];
-            t_prof_pow0      <= reg_prof_pow[0];
-            t_prof_pow1      <= reg_prof_pow[1];
-            t_prof_pow2      <= reg_prof_pow[2];
-            t_prof_pow3      <= reg_prof_pow[3];
-            xfer_tgl         <= ~xfer_tgl;
-        end
+            A_FSTART_L: s_fstart[15:0]  <= bus_wdata;
+            A_FSTART_H: s_fstart[31:16] <= bus_wdata;
+            A_FSTOP_L:  s_fstop[15:0]   <= bus_wdata;
+            A_FSTOP_H:  s_fstop[31:16]  <= bus_wdata;
+            A_FDELTA_L: s_fdelta[15:0]  <= bus_wdata;
+            A_FDELTA_H: s_fdelta[31:16] <= bus_wdata;
+            A_RATE_L:   s_rate[15:0]    <= bus_wdata;
+            A_RATE_H:   s_rate[31:16]   <= bus_wdata;
+            A_PROF_CTRL: begin
+                s_psel <= bus_wdata[1:0];
+                s_pext <= bus_wdata[4];
+            end
+            A_P0F_L: s_pfw[0][15:0]  <= bus_wdata;
+            A_P0F_H: s_pfw[0][31:16] <= bus_wdata;
+            A_P1F_L: s_pfw[1][15:0]  <= bus_wdata;
+            A_P1F_H: s_pfw[1][31:16] <= bus_wdata;
+            A_P2F_L: s_pfw[2][15:0]  <= bus_wdata;
+            A_P2F_H: s_pfw[2][31:16] <= bus_wdata;
+            A_P3F_L: s_pfw[3][15:0]  <= bus_wdata;
+            A_P3F_H: s_pfw[3][31:16] <= bus_wdata;
+            A_P0POW: s_ppow[0] <= bus_wdata;
+            A_P1POW: s_ppow[1] <= bus_wdata;
+            A_P2POW: s_ppow[2] <= bus_wdata;
+            A_P3POW: s_ppow[3] <= bus_wdata;
+            A_IRQ_EN: s_irq_en <= bus_wdata[2:0];
+            default: ;
+        endcase
     end
 end
 
-// Event toggles toward the core. Delayed two cycles behind the write so the
-// capture toggle (one cycle delay) always crosses first; both cross through
-// equal-depth synchronizers, so e.g. "write sweep config + START with AUTO"
-// loads the config before the start pulse fires.
-reg srst_p1, srst_p2, start_p1, start_p2, abort_p1, abort_p2;
+// ------------------------------------------------- deferred commit at CS rise
+// Everything the frame asked for fires together on bus_frame_end: the config
+// commit first (cfg_apply), and the sweep events in the same cycle - the core
+// latches the new config on that edge and the sweep engine starts from it.
+reg pend_cfg, pend_srst, pend_start, pend_abort;
 
-always @(posedge PCLK or negedge PRESETn) begin
-    if (!PRESETn) begin
-        {srst_p1, srst_p2, start_p1, start_p2, abort_p1, abort_p2} <= 6'b0;
-        srst_tgl  <= 1'b0;
-        start_tgl <= 1'b0;
-        abort_tgl <= 1'b0;
+always @(posedge clk or negedge rstn) begin
+    if (!rstn) begin
+        pend_cfg   <= 1'b0;  pend_srst  <= 1'b0;
+        pend_start <= 1'b0;  pend_abort <= 1'b0;
+        cfg_apply  <= 1'b0;  srst_p     <= 1'b0;
+        start_p    <= 1'b0;  abort_p    <= 1'b0;
     end else begin
-        srst_p1  <= srst_write;   srst_p2  <= srst_p1;
-        start_p1 <= start_write;  start_p2 <= start_p1;
-        abort_p1 <= abort_write;  abort_p2 <= abort_p1;
-        if (srst_p2)  srst_tgl  <= ~srst_tgl;
-        if (start_p2) start_tgl <= ~start_tgl;
-        if (abort_p2) abort_tgl <= ~abort_tgl;
+        cfg_apply <= 1'b0;  srst_p  <= 1'b0;
+        start_p   <= 1'b0;  abort_p <= 1'b0;
+
+        if (upd_write || (s_auto && cfg_write)) pend_cfg   <= 1'b1;
+        if (srst_write)                         pend_srst  <= 1'b1;
+        if (start_write)                        pend_start <= 1'b1;
+        if (abort_write)                        pend_abort <= 1'b1;
+
+        if (bus_frame_end) begin
+            cfg_apply  <= pend_cfg;    pend_cfg   <= 1'b0;
+            srst_p     <= pend_srst;   pend_srst  <= 1'b0;
+            start_p    <= pend_start;  pend_start <= 1'b0;
+            abort_p    <= pend_abort;  pend_abort <= 1'b0;
+        end
     end
 end
 
-// Interrupt flags (set by core events, W1C, cleared by soft reset)
-wire done_p, wrap_p;
-dds_cdc_pulse u_sync_done (.clk(PCLK), .rstn(PRESETn), .tgl_in(evt_done_tgl), .pulse(done_p));
-dds_cdc_pulse u_sync_wrap (.clk(PCLK), .rstn(PRESETn), .tgl_in(evt_wrap_tgl), .pulse(wrap_p));
+// ------------------------------------------------------------ interrupt flags
+// bit0 sweep done, bit1 sweep wrap, bit2 config update done. W1C.
+wire irq_stat_write = reg_hit && (widx == A_IRQ_STAT);
 
-wire irq_stat_write = APB_write_en && !ram_sel && (widx == A_IRQ_STAT);
-
-always @(posedge PCLK or negedge PRESETn) begin
-    if (!PRESETn) begin
-        reg_irq_stat <= 3'b000;
-    end else if (srst_write) begin
-        reg_irq_stat <= 3'b000;
+always @(posedge clk or negedge rstn) begin
+    if (!rstn) begin
+        s_irq_stat <= 3'b000;
+    end else if (srst_p) begin
+        s_irq_stat <= 3'b000;
     end else begin
-        // set has priority over W1C
-        reg_irq_stat[0] <= done_p ? 1'b1 : (irq_stat_write && PWDATA[0] ? 1'b0 : reg_irq_stat[0]);
-        reg_irq_stat[1] <= wrap_p ? 1'b1 : (irq_stat_write && PWDATA[1] ? 1'b0 : reg_irq_stat[1]);
-        reg_irq_stat[2] <= ack_p  ? 1'b1 : (irq_stat_write && PWDATA[2] ? 1'b0 : reg_irq_stat[2]);
+        // a new event wins over a concurrent write-1-to-clear
+        s_irq_stat[0] <= evt_done_p ? 1'b1 :
+                         (irq_stat_write && bus_wdata[0]) ? 1'b0 : s_irq_stat[0];
+        s_irq_stat[1] <= evt_wrap_p ? 1'b1 :
+                         (irq_stat_write && bus_wdata[1]) ? 1'b0 : s_irq_stat[1];
+        s_irq_stat[2] <= upd_done_p ? 1'b1 :
+                         (irq_stat_write && bus_wdata[2]) ? 1'b0 : s_irq_stat[2];
     end
 end
 
-assign dds_irq = |(reg_irq_stat & reg_irq_en);
+assign dds_irq = |(s_irq_stat & s_irq_en);
 
-// Status synchronizers (informational; ACTIVE_PROF bits sync independently)
-wire stat_active_s, stat_dir_s, stat_prof0_s, stat_prof1_s;
-dds_cdc_bit u_sync_act  (.clk(PCLK), .rstn(PRESETn), .d(stat_sweep_active),   .q(stat_active_s));
-dds_cdc_bit u_sync_dir  (.clk(PCLK), .rstn(PRESETn), .d(stat_sweep_dir),      .q(stat_dir_s));
-dds_cdc_bit u_sync_pr0  (.clk(PCLK), .rstn(PRESETn), .d(stat_active_prof[0]), .q(stat_prof0_s));
-dds_cdc_bit u_sync_pr1  (.clk(PCLK), .rstn(PRESETn), .d(stat_active_prof[1]), .q(stat_prof1_s));
+// ---------------------------------------------------------- waveform RAM port
+assign ram_we    = bus_we && ram_sel;
+assign ram_addr  = bus_addr[11:0];
+assign ram_wdata = bus_wdata[13:0];
 
-// Waveform RAM port A: read is fetched in the APB setup phase so data is
-// ready in the access phase with zero wait states; write lands in the
-// access phase.
-assign ram_we    = APB_write_en && ram_sel;
-assign ram_en    = (PSEL && !PENABLE && ram_sel) || ram_we;
-assign ram_addr  = PADDR[13:2];
-assign ram_wdata = PWDATA[13:0];
+// --------------------------------------------------------------- read channel
+// One pipeline stage, matching the RAM read latency, so the SPI slave sees a
+// uniform 2-cycle bus read.
+reg [15:0] reg_rdata;
+reg        ram_sel_d;
 
-// APB Read Data
 always @(*) begin
-    PRDATA = 32'h0;
-    if (APB_read_en) begin
-        if (ram_sel) begin
-            PRDATA = {18'h0, ram_rdata};
-        end else begin
-            case (widx)
-                A_ID:           PRDATA = VERSION;
-                A_CTRL:         PRDATA = {17'h0, reg_out_inv, reg_out_fmt, reg_out_width,
-                                          2'b00, reg_freq_mode, 1'b0, reg_wave_sel,
-                                          3'b000, reg_en};
-                A_STATUS:       PRDATA = {27'h0, busy, stat_prof1_s, stat_prof0_s,
-                                          stat_dir_s, stat_active_s};
-                A_FWORD:        PRDATA = reg_fword;
-                A_POW:          PRDATA = {16'h0, reg_pow};
-                A_AMP:          PRDATA = {15'h0, reg_amp};
-                A_DUTY:         PRDATA = {16'h0, reg_duty};
-                A_UPDATE:       PRDATA = {30'h0, reg_auto, 1'b0};
-                A_SWEEP_CTRL:   PRDATA = {29'h0, reg_sweep_ext_trig, reg_sweep_mode};
-                A_SWEEP_FSTART: PRDATA = reg_sweep_fstart;
-                A_SWEEP_FSTOP:  PRDATA = reg_sweep_fstop;
-                A_SWEEP_FDELTA: PRDATA = reg_sweep_fdelta;
-                A_SWEEP_RATE:   PRDATA = {8'h0, reg_sweep_rate};
-                A_PROF_CTRL:    PRDATA = {27'h0, reg_prof_ext_sel, 2'b00, reg_prof_sel};
-                A_PROF0_FWORD:  PRDATA = reg_prof_fword[0];
-                A_PROF1_FWORD:  PRDATA = reg_prof_fword[1];
-                A_PROF2_FWORD:  PRDATA = reg_prof_fword[2];
-                A_PROF3_FWORD:  PRDATA = reg_prof_fword[3];
-                A_PROF_POW10:   PRDATA = {reg_prof_pow[1], reg_prof_pow[0]};
-                A_PROF_POW32:   PRDATA = {reg_prof_pow[3], reg_prof_pow[2]};
-                A_IRQ_EN:       PRDATA = {29'h0, reg_irq_en};
-                A_IRQ_STAT:     PRDATA = {29'h0, reg_irq_stat};
-                A_OFFSET:       PRDATA = {18'h0, reg_offset};
-                default:        PRDATA = 32'h0;
-            endcase
-        end
+    case (widx)
+        A_ID:        reg_rdata = ID_CODE;
+        A_VER:       reg_rdata = VERSION;
+        A_CTRL:      reg_rdata = {1'b0, s_inv, s_fmt2c, s_w12, 2'b00,
+                                  s_fmode, 1'b0, s_wave, 3'b000, s_en};
+        A_STATUS:    reg_rdata = {12'h0, stat_active_prof, stat_sweep_dir,
+                                  stat_sweep_active};
+        A_FWORD_L:   reg_rdata = s_fword[15:0];
+        A_FWORD_H:   reg_rdata = s_fword[31:16];
+        A_POW:       reg_rdata = s_pow;
+        A_AMP:       reg_rdata = s_amp;
+        A_DUTY:      reg_rdata = s_duty;
+        A_OFFSET:    reg_rdata = {2'b00, s_offset};
+        A_UPDATE:    reg_rdata = {14'h0, s_auto, 1'b0};
+        A_SWCTRL:    reg_rdata = {13'h0, s_sw_ext, s_swmode};
+        A_FSTART_L:  reg_rdata = s_fstart[15:0];
+        A_FSTART_H:  reg_rdata = s_fstart[31:16];
+        A_FSTOP_L:   reg_rdata = s_fstop[15:0];
+        A_FSTOP_H:   reg_rdata = s_fstop[31:16];
+        A_FDELTA_L:  reg_rdata = s_fdelta[15:0];
+        A_FDELTA_H:  reg_rdata = s_fdelta[31:16];
+        A_RATE_L:    reg_rdata = s_rate[15:0];
+        A_RATE_H:    reg_rdata = s_rate[31:16];
+        A_PROF_CTRL: reg_rdata = {11'h0, s_pext, 2'b00, s_psel};
+        A_P0F_L:     reg_rdata = s_pfw[0][15:0];
+        A_P0F_H:     reg_rdata = s_pfw[0][31:16];
+        A_P1F_L:     reg_rdata = s_pfw[1][15:0];
+        A_P1F_H:     reg_rdata = s_pfw[1][31:16];
+        A_P2F_L:     reg_rdata = s_pfw[2][15:0];
+        A_P2F_H:     reg_rdata = s_pfw[2][31:16];
+        A_P3F_L:     reg_rdata = s_pfw[3][15:0];
+        A_P3F_H:     reg_rdata = s_pfw[3][31:16];
+        A_P0POW:     reg_rdata = s_ppow[0];
+        A_P1POW:     reg_rdata = s_ppow[1];
+        A_P2POW:     reg_rdata = s_ppow[2];
+        A_P3POW:     reg_rdata = s_ppow[3];
+        A_IRQ_EN:    reg_rdata = {13'h0, s_irq_en};
+        A_IRQ_STAT:  reg_rdata = {13'h0, s_irq_stat};
+        default:     reg_rdata = 16'h0;
+    endcase
+end
+
+always @(posedge clk or negedge rstn) begin
+    if (!rstn) begin
+        bus_rdata <= 16'h0;
+        ram_sel_d <= 1'b0;
+    end else begin
+        ram_sel_d <= ram_sel;
+        bus_rdata <= ram_sel_d ? {2'b00, ram_rdata} : reg_rdata;
     end
 end
 

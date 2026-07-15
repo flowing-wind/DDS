@@ -1,194 +1,128 @@
 // dds_top.v - DDS IP core, top level
 //
-// APB-configured direct digital synthesizer with 12/14-bit parallel DAC
-// output. See Doc/DDS_Datasheet.md for the register map and usage.
+// One 16-bit SPI slave port (mode 0) driving one or two independent DDS
+// channels, each with its own 14-bit parallel DAC output. Instantiate this.
 //
-// Clocking: PCLK is the APB bus clock, dds_clk is the DAC sample clock.
-// They may be the same PLL output (tie both to it) or fully asynchronous;
-// all crossings are handled internally.
+// Everything runs in the dds_clk domain, including the SPI front end (the SPI
+// pins are oversampled). There is exactly one clock and one reset - no CDC to
+// constrain, no second bus clock. The only requirement is
+//
+//     f_sck <= dds_clk / 6
+//
+// which a 9 MHz STM32 SPI against a 100 MHz dds_clk satisfies with 11x margin.
+//
+// Channel select is CMD[14] of the SPI command word, so both channels share a
+// single chip select. See Doc/DDS_Datasheet.md for the frame format and the
+// register map.
 
 module dds_top #(
+    parameter NUM_CH       = 2,                  // 1 or 2
     parameter SIN_LUT_FILE = "dds_sin_lut.mem"
 ) (
-    // APB
-    input  wire        PCLK,
-    input  wire        PRESETn,
+    input  wire        dds_clk,      // DAC sample clock, e.g. 100 MHz
+    input  wire        dds_rstn,     // active-low, synchronous release recommended
 
-    input  wire [14:0] PADDR,
-    input  wire        PSEL,
-    input  wire        PENABLE,
-    input  wire        PWRITE,
-    input  wire [31:0] PWDATA,
-    output wire [31:0] PRDATA,
-    output wire        PREADY,
+    // SPI slave (mode 0, 16-bit words, CS active low)
+    input  wire        spi_sck,
+    input  wire        spi_cs_n,
+    input  wire        spi_mosi,
+    output wire        spi_miso,
+    output wire        spi_miso_oe,  // for a tri-stated / shared MISO net
 
-    // DDS sample clock domain
-    input  wire        dds_clk,
-    input  wire        dds_rstn,
+    // hardware pacing hooks (asynchronous pins or on-chip logic)
+    input  wire        ch0_sweep_trig,
+    input  wire [1:0]  ch0_hop_sel,
+    input  wire        ch1_sweep_trig,
+    input  wire [1:0]  ch1_hop_sel,
 
-    // hardware pacing hooks for other IP (SPI, user logic, pins)
-    input  wire        sweep_trig,   // sweep start, rising edge
-    input  wire [1:0]  hop_sel,      // profile select (FSK/PSK data)
+    // DAC interfaces (dds_clk domain)
+    output wire [13:0] ch0_dac_data,
+    output wire        ch0_dac_valid,
+    output wire [13:0] ch1_dac_data,
+    output wire        ch1_dac_valid,
 
-    // DAC interface (dds_clk domain)
-    output wire [13:0] dac_data,
-    output wire        dac_valid,
-
-    // Interrupt Request
-    output wire        dds_irq
+    // interrupt request, one bit per channel
+    output wire [1:0]  dds_irq
 );
 
-// regs <-> core
-wire [31:0] t_fword, t_sweep_fstart, t_sweep_fstop, t_sweep_fdelta;
-wire [31:0] t_prof_fword0, t_prof_fword1, t_prof_fword2, t_prof_fword3;
-wire [16:0] t_amp;
-wire [15:0] t_pow, t_duty;
-wire [13:0] t_offset;
-wire [15:0] t_prof_pow0, t_prof_pow1, t_prof_pow2, t_prof_pow3;
-wire [23:0] t_sweep_rate;
-wire [2:0]  t_wave_sel;
-wire [1:0]  t_freq_mode, t_sweep_mode, t_prof_sel;
-wire        t_out_width, t_out_fmt, t_out_inv, t_sweep_ext_trig, t_prof_ext_sel;
-wire        cfg_en, xfer_tgl, srst_tgl, start_tgl, abort_tgl;
-wire        upd_ack_tgl, evt_done_tgl, evt_wrap_tgl;
-wire        stat_sweep_active, stat_sweep_dir;
-wire [1:0]  stat_active_prof;
+wire        bus_ch;
+wire [13:0] bus_addr;
+wire [15:0] bus_wdata;
+wire        bus_we;
+wire        bus_frame_end;
+wire [15:0] bus_rdata;
 
-// regs <-> wave RAM port A
-wire        ram_en, ram_we;
-wire [11:0] ram_addr;
-wire [13:0] ram_wdata, ram_rdata;
+wire [15:0] rdata_ch0, rdata_ch1;
 
-// core <-> wave RAM port B
-wire [11:0] wave_addr;
-wire [13:0] wave_rdata;
+assign bus_rdata = (bus_ch && (NUM_CH > 1)) ? rdata_ch1 : rdata_ch0;
 
-dds_regs u_regs (
-    .PCLK              (PCLK),
-    .PRESETn           (PRESETn),
-    .PADDR             (PADDR),
-    .PSEL              (PSEL),
-    .PENABLE           (PENABLE),
-    .PWRITE            (PWRITE),
-    .PWDATA            (PWDATA),
-    .PRDATA            (PRDATA),
-    .PREADY            (PREADY),
+dds_spi_slave u_spi (
+    .clk           (dds_clk),
+    .rstn          (dds_rstn),
 
-    .t_fword           (t_fword),
-    .t_pow             (t_pow),
-    .t_amp             (t_amp),
-    .t_duty            (t_duty),
-    .t_offset          (t_offset),
-    .t_wave_sel        (t_wave_sel),
-    .t_freq_mode       (t_freq_mode),
-    .t_out_width       (t_out_width),
-    .t_out_fmt         (t_out_fmt),
-    .t_out_inv         (t_out_inv),
-    .t_sweep_mode      (t_sweep_mode),
-    .t_sweep_ext_trig  (t_sweep_ext_trig),
-    .t_sweep_fstart    (t_sweep_fstart),
-    .t_sweep_fstop     (t_sweep_fstop),
-    .t_sweep_fdelta    (t_sweep_fdelta),
-    .t_sweep_rate      (t_sweep_rate),
-    .t_prof_sel        (t_prof_sel),
-    .t_prof_ext_sel    (t_prof_ext_sel),
-    .t_prof_fword0     (t_prof_fword0),
-    .t_prof_fword1     (t_prof_fword1),
-    .t_prof_fword2     (t_prof_fword2),
-    .t_prof_fword3     (t_prof_fword3),
-    .t_prof_pow0       (t_prof_pow0),
-    .t_prof_pow1       (t_prof_pow1),
-    .t_prof_pow2       (t_prof_pow2),
-    .t_prof_pow3       (t_prof_pow3),
+    .spi_sck       (spi_sck),
+    .spi_cs_n      (spi_cs_n),
+    .spi_mosi      (spi_mosi),
+    .spi_miso      (spi_miso),
+    .spi_miso_oe   (spi_miso_oe),
 
-    .cfg_en            (cfg_en),
-    .xfer_tgl          (xfer_tgl),
-    .srst_tgl          (srst_tgl),
-    .start_tgl         (start_tgl),
-    .abort_tgl         (abort_tgl),
-
-    .upd_ack_tgl       (upd_ack_tgl),
-    .evt_done_tgl      (evt_done_tgl),
-    .evt_wrap_tgl      (evt_wrap_tgl),
-    .stat_sweep_active (stat_sweep_active),
-    .stat_sweep_dir    (stat_sweep_dir),
-    .stat_active_prof  (stat_active_prof),
-
-    .ram_en            (ram_en),
-    .ram_we            (ram_we),
-    .ram_addr          (ram_addr),
-    .ram_wdata         (ram_wdata),
-    .ram_rdata         (ram_rdata),
-
-    .dds_irq           (dds_irq)
+    .bus_ch        (bus_ch),
+    .bus_addr      (bus_addr),
+    .bus_wdata     (bus_wdata),
+    .bus_we        (bus_we),
+    .bus_frame_end (bus_frame_end),
+    .bus_rdata     (bus_rdata)
 );
 
-dds_core #(
-    .SIN_LUT_FILE      (SIN_LUT_FILE)
-) u_core (
-    .dds_clk           (dds_clk),
-    .dds_rstn          (dds_rstn),
+// Writes and the frame-end commit are steered by the channel bit; reads are
+// muxed above. A frame never addresses both channels.
+dds_channel #(
+    .SIN_LUT_FILE  (SIN_LUT_FILE)
+) u_ch0 (
+    .clk           (dds_clk),
+    .rstn          (dds_rstn),
 
-    .t_fword           (t_fword),
-    .t_pow             (t_pow),
-    .t_amp             (t_amp),
-    .t_duty            (t_duty),
-    .t_offset          (t_offset),
-    .t_wave_sel        (t_wave_sel),
-    .t_freq_mode       (t_freq_mode),
-    .t_out_width       (t_out_width),
-    .t_out_fmt         (t_out_fmt),
-    .t_out_inv         (t_out_inv),
-    .t_sweep_mode      (t_sweep_mode),
-    .t_sweep_ext_trig  (t_sweep_ext_trig),
-    .t_sweep_fstart    (t_sweep_fstart),
-    .t_sweep_fstop     (t_sweep_fstop),
-    .t_sweep_fdelta    (t_sweep_fdelta),
-    .t_sweep_rate      (t_sweep_rate),
-    .t_prof_sel        (t_prof_sel),
-    .t_prof_ext_sel    (t_prof_ext_sel),
-    .t_prof_fword0     (t_prof_fword0),
-    .t_prof_fword1     (t_prof_fword1),
-    .t_prof_fword2     (t_prof_fword2),
-    .t_prof_fword3     (t_prof_fword3),
-    .t_prof_pow0       (t_prof_pow0),
-    .t_prof_pow1       (t_prof_pow1),
-    .t_prof_pow2       (t_prof_pow2),
-    .t_prof_pow3       (t_prof_pow3),
+    .bus_addr      (bus_addr),
+    .bus_wdata     (bus_wdata),
+    .bus_we        (bus_we        && !bus_ch),
+    .bus_frame_end (bus_frame_end && !bus_ch),
+    .bus_rdata     (rdata_ch0),
 
-    .cfg_en            (cfg_en),
-    .xfer_tgl          (xfer_tgl),
-    .srst_tgl          (srst_tgl),
-    .start_tgl         (start_tgl),
-    .abort_tgl         (abort_tgl),
-    .upd_ack_tgl       (upd_ack_tgl),
-    .evt_done_tgl      (evt_done_tgl),
-    .evt_wrap_tgl      (evt_wrap_tgl),
-    .stat_sweep_active (stat_sweep_active),
-    .stat_sweep_dir    (stat_sweep_dir),
-    .stat_active_prof  (stat_active_prof),
+    .sweep_trig    (ch0_sweep_trig),
+    .hop_sel       (ch0_hop_sel),
 
-    .sweep_trig        (sweep_trig),
-    .hop_sel           (hop_sel),
-
-    .wave_addr         (wave_addr),
-    .wave_rdata        (wave_rdata),
-
-    .dac_data          (dac_data),
-    .dac_valid         (dac_valid)
+    .dac_data      (ch0_dac_data),
+    .dac_valid     (ch0_dac_valid),
+    .dds_irq       (dds_irq[0])
 );
 
-dds_wave_ram u_wave_ram (
-    .clka  (PCLK),
-    .ena   (ram_en),
-    .wea   (ram_we),
-    .addra (ram_addr),
-    .dina  (ram_wdata),
-    .douta (ram_rdata),
-    .clkb  (dds_clk),
-    .enb   (1'b1),
-    .addrb (wave_addr),
-    .doutb (wave_rdata)
-);
+generate
+if (NUM_CH > 1) begin : g_ch1
+    dds_channel #(
+        .SIN_LUT_FILE  (SIN_LUT_FILE)
+    ) u_ch1 (
+        .clk           (dds_clk),
+        .rstn          (dds_rstn),
+
+        .bus_addr      (bus_addr),
+        .bus_wdata     (bus_wdata),
+        .bus_we        (bus_we        && bus_ch),
+        .bus_frame_end (bus_frame_end && bus_ch),
+        .bus_rdata     (rdata_ch1),
+
+        .sweep_trig    (ch1_sweep_trig),
+        .hop_sel       (ch1_hop_sel),
+
+        .dac_data      (ch1_dac_data),
+        .dac_valid     (ch1_dac_valid),
+        .dds_irq       (dds_irq[1])
+    );
+end else begin : g_no_ch1
+    assign rdata_ch1     = 16'h0;
+    assign ch1_dac_data  = 14'h0;
+    assign ch1_dac_valid = 1'b0;
+    assign dds_irq[1]    = 1'b0;
+end
+endgenerate
 
 endmodule // dds_top
