@@ -1,0 +1,16 @@
+Fitter Status : Successful - Sat Jul 01 15:57:35 2017
+Quartus II Version : 9.0 Build 132 02/25/2009 SJ Full Version
+Revision Name : ad9226
+Top-level Entity Name : ad9226_1
+Family : Cyclone II
+Device : EP2C5T144C8
+Timing Models : Final
+Total logic elements : 738 / 4,608 ( 16 % )
+    Total combinational functions : 381 / 4,608 ( 8 % )
+    Dedicated logic registers : 607 / 4,608 ( 13 % )
+Total registers : 607
+Total pins : 55 / 89 ( 62 % )
+Total virtual pins : 0
+Total memory bits : 53,248 / 119,808 ( 44 % )
+Embedded Multiplier 9-bit elements : 0 / 26 ( 0 % )
+Total PLLs : 1 / 2 ( 50 % )

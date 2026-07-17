@@ -55,6 +55,14 @@ module dds_core #(
     input  wire        start_p,           // 1-cycle: sweep start
     input  wire        abort_p,           // 1-cycle: sweep abort
 
+    // Amplitude override, for the AGC loop (or any external control). While
+    // amp_ovr_en is high the datapath follows amp_ovr live instead of the AMP
+    // register; dropping it hands control straight back to AMP. amp_cur always
+    // reports whichever one is actually in use.
+    input  wire        amp_ovr_en,
+    input  wire [15:0] amp_ovr,           // Q1.15
+    output wire [15:0] amp_cur,
+
     output reg         upd_done_p,        // 1-cycle: config latched
     output reg         evt_done_p,        // 1-cycle: single sweep finished
     output reg         evt_wrap_p,        // 1-cycle: sweep wrapped / reversed
@@ -120,7 +128,7 @@ always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn) begin
         a_fword <= 32'h0;   a_fstart <= 32'h0;  a_fdelta <= 32'h0;
         a_limit <= 32'h0;   a_pow <= 16'h0;     a_duty <= 16'h8000;
-        a_amp <= 16'h8000;  a_offset <= 14'sd0;
+        a_offset <= 14'sd0;
         a_wave <= W_SIN;    a_mode <= M_FIXED;
         a_swmode <= SW_SINGLE; a_psel <= 2'd0;
         a_ext_trig <= 1'b0; a_ext_psel <= 1'b0; a_rate <= 32'd1;
@@ -139,7 +147,6 @@ always @(posedge dds_clk or negedge dds_rstn) begin
             a_limit    <= cfg_sweep_fstop - cfg_sweep_fstart;
             a_pow      <= cfg_pow;
             a_duty     <= cfg_duty;
-            a_amp      <= cfg_amp;
             a_offset   <= $signed(cfg_offset);
             a_wave     <= cfg_wave_sel;
             a_mode     <= cfg_freq_mode;
@@ -158,6 +165,20 @@ always @(posedge dds_clk or negedge dds_rstn) begin
         end
     end
 end
+
+// The AMP register path, latched on cfg_apply like every other config field.
+// It deliberately keeps latching while the override is active, so the moment
+// amp_ovr_en drops the datapath is already holding the register value - the
+// handback is bumpless by construction, not by sequencing.
+always @(posedge dds_clk or negedge dds_rstn) begin
+    if (!dds_rstn)      a_amp <= 16'h8000;
+    else if (cfg_apply) a_amp <= cfg_amp;
+end
+
+// What the multiplier actually uses. amp_cur is the readback truth: it always
+// says what is scaling the waveform right now, loop or register.
+wire [15:0] amp_eff = amp_ovr_en ? amp_ovr : a_amp;
+assign amp_cur = amp_eff;
 
 // ------------------------------------------------------------ sweep engine
 // Frequency accumulator + ramp timing logic (tutorial Fig. 11.3): every
@@ -332,7 +353,7 @@ end
 reg signed [30:0] prod4;
 always @(posedge dds_clk or negedge dds_rstn) begin
     if (!dds_rstn)    prod4 <= 31'sd0;
-    else if (cfg_en)  prod4 <= smp3 * $signed({1'b0, a_amp});
+    else if (cfg_en)  prod4 <= smp3 * $signed({1'b0, amp_eff});
 end
 
 // s5: round to nearest, add DC offset, saturate to 14-bit signed.

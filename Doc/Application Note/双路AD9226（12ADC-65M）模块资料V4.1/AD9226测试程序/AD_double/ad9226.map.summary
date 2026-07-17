@@ -1,0 +1,14 @@
+Analysis & Synthesis Status : Successful - Sat Jul 01 15:57:29 2017
+Quartus II Version : 9.0 Build 132 02/25/2009 SJ Full Version
+Revision Name : ad9226
+Top-level Entity Name : ad9226_1
+Family : Cyclone II
+Total logic elements : 739
+    Total combinational functions : 380
+    Dedicated logic registers : 607
+Total registers : 607
+Total pins : 55
+Total virtual pins : 0
+Total memory bits : 53,248
+Embedded Multiplier 9-bit elements : 0
+Total PLLs : 1

@@ -21,11 +21,16 @@ the DAC never gets a clock.
 board/dds_board_top.v        <- set this as top
  ├── clk_wiz_0 (PLL IP)      <- board oscillator -> 100 MHz dds_clk
  ├── reset synchronizer      <- async assert, sync release, held until PLL lock
- ├── rtl/dds_top.v           <- the IP core (NUM_CH = 2)
+ ├── rtl/dds_top.v           <- the IP core (NUM_CH = 2, HAS_ADC = 1)
  │    ├── dds_spi_slave.v
- │    └── dds_channel.v × 2  (dds_regs + dds_core + dds_wave_ram + dds_sin_lut)
+ │    ├── dds_channel.v × 2  (dds_regs + dds_core + dds_wave_ram + dds_sin_lut
+ │    │                        + dds_meas/dds_isqrt/dds_agc/dds_agc_regs)
+ │    ├── dds_adc_if.v       <- AD9226 capture timing + data conditioning
+ │    └── dds_glob_regs.v    <- ADC front-end registers
  ├── IOB output registers    <- dac_data leaves with matched clock-to-out delay
- └── ODDR × 2                <- forwards an inverted dds_clk to CLKA / CLKB
+ ├── ODDR × 2                <- forwards an inverted dds_clk to CLKA / CLKB
+ ├── ODDR × 2                <- 50 MHz ADC clocks (dds_clk/2 pattern) to ACLK/BCLK
+ └── IOB input registers     <- ADC data captured at the pad (CE-gated)
 ```
 
 ## Files to add to the project
@@ -74,6 +79,13 @@ I/O bank).
 **Adapting it to another board:** change the `PACKAGE_PIN` assignments to match
 your wiring. Keep `LVCMOS33` unless your bank voltage differs.
 
+**ADC pins:** the AD9226 module's pins are a commented template at the end of
+the bundled XDC — fill in your `PACKAGE_PIN`s and uncomment. Mind the mapping
+direction: the module's silk screen is numbered backwards (silk **D0 is the
+MSB** → `adc0_data[11]`); the template spells it out per bit, and
+[AN02](Application%20Note/AN02_AD9226_Module.md) explains why and how to
+verify it in one register read.
+
 **Recommended additions** — the bundled XDC pins the design but does not yet
 constrain timing. For a robust build, add:
 
@@ -111,12 +123,16 @@ skipping ahead wastes hours:
    Nothing works without it, and a wrong oscillator frequency in the clk_wiz
    config fails exactly here.
 2. **Does the SPI link answer?** On the STM32 console, `id` must print
-   `ch0 ID 0x4453 VERSION 0x0200` for both channels. If it returns `0x0000` or
+   `ch0 ID 0x4453 VERSION 0x0210` for both channels. If it returns `0x0000` or
    garbage, the problem is the four SPI wires or the common ground — not the DAC.
    (An ILA on `spi_cs_n` / `spi_sck` / `spi_mosi` settles it in one shot.)
 3. **Does the DAC move?** `freq 1M`, `wave sine`, `fmt ob`, `on`. Offset binary
    is mandatory for this module (AN01 §2).
 4. Only then worry about signal quality, images and the filter.
+5. **ADC / amplitude loop** (if wired): follow the bring-up checklist in
+   [AN02 §6](Application%20Note/AN02_AD9226_Module.md) — `reg 80` (GLOB_ID),
+   grounded-input `adc` read, known-DC sign check, `meas`, then `agc on`. Each
+   step isolates a different wiring or configuration fault.
 
 A dead-flat sine with working square/triangle means the sine LUT is empty — see
 the `.mem` warning above.

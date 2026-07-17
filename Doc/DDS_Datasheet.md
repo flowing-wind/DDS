@@ -8,14 +8,16 @@ Companion firmware: `MCU/STM32F1` (STM32F103 master + UART command line).
 
 | | |
 |---|---|
-| Version | 2.0 (`ID` = 0x4453, `VERSION` = 0x0200) |
+| Version | 2.1 (`ID` = 0x4453, `VERSION` = 0x0210) |
 | Bus | SPI slave, mode 0 (CPOL=0, CPHA=0), 16-bit words, MSB first |
 | Channels | 1 or 2 (`NUM_CH`), selected by a bit in the command word — one chip select for both |
 | Clock | Single domain: `dds_clk` (100 MHz recommended). SPI pins are oversampled. |
 | DAC | 14-bit (or 12-bit MSB-aligned), offset binary or two's complement |
+| ADC | optional (`HAS_ADC`): dual 12-bit parallel capture at `dds_clk`/2, for the amplitude loop and export |
 | Frequency | 32-bit tuning word, 23.3 mHz resolution at 100 MHz |
 | Waveforms | sine, cosine, square (programmable duty), triangle, ramp, user RAM (4096 × 14) |
 | Modes | fixed, hardware linear sweep/chirp, 4-profile frequency+phase hopping |
+| Amplitude | open-loop Q1.15 scale, or closed-loop on a measured Vpp / RMS per channel |
 
 ---
 
@@ -41,7 +43,17 @@ Companion firmware: `MCU/STM32F1` (STM32F103 master + UART command line).
 - **Atomic frame commit** — every parameter a frame writes takes effect
   together, on the rising edge of chip select. A 32-bit frequency word written
   as two 16-bit halves never puts an intermediate frequency on the DAC.
-- **Single clock domain** — no CDC to constrain, no second bus clock
+- **Single clock domain** — no CDC to constrain, no second bus clock; with
+  `HAS_ADC` the ADC clock is generated as a `dds_clk`/2 ODDR pattern and the
+  returning data is captured with a clock enable, so this stays true
+- **ADC capture front end** (optional, `HAS_ADC`): dual AD9226-style 12-bit
+  parallel inputs at 50 MSPS, with programmable capture phase, bus reversal
+  and sign correction; the captured streams are exported for other fabric users
+- **Closed-loop amplitude control per channel**: a hardware measurement unit
+  (Vpp, AC-RMS, mean, min/max over a programmable window) and an integrating
+  controller that drives the amplitude multiplier toward a target, with dead
+  band, anti-windup clamps and lock/saturation status — source-selectable
+  between the two ADCs, fully register-controlled
 - Interrupt output per channel (sweep done / wrap, update done)
 
 ---
@@ -144,7 +156,8 @@ waveform and setting. Only matters if you align the output with external events.
 ```verilog
 dds_top #(
     .NUM_CH       (2),                  // 1 or 2
-    .SIN_LUT_FILE ("dds_sin_lut.mem")
+    .SIN_LUT_FILE ("dds_sin_lut.mem"),
+    .HAS_ADC      (1)                   // 0 removes the ADC + amplitude loops
 ) u_dds (
     .dds_clk(clk100), .dds_rstn(rstn),
     .spi_sck(sck), .spi_cs_n(cs_n), .spi_mosi(mosi),
@@ -153,6 +166,12 @@ dds_top #(
     .ch1_sweep_trig(1'b0), .ch1_hop_sel(2'b00),
     .ch0_dac_data(dac0), .ch0_dac_valid(dv0),
     .ch1_dac_data(dac1), .ch1_dac_valid(dv1),
+    // ADC front end: board ODDR + IOB capture flops, see section 6.5
+    .adc_clk_d1(ad1), .adc_clk_d2(ad2), .adc_capt_en(ace),
+    .adc0_data(a0), .adc0_otr(1'b0), .adc1_data(a1), .adc1_otr(1'b0),
+    // captured streams, free for any other fabric consumer
+    .adc0_smp(), .adc0_smp_otr(), .adc1_smp(), .adc1_smp_otr(),
+    .adc_smp_valid(),
     .dds_irq(irq)
 );
 ```
@@ -171,9 +190,30 @@ dds_top #(
 | `chN_dac_data`   | out | 14 | Parallel DAC data, registered. |
 | `chN_dac_valid`  | out | 1  | High while the output is live (CTRL.EN and the pipeline is full). |
 | `dds_irq`        | out | 2  | One level interrupt per channel, `|(IRQ_STAT & IRQ_EN)`. |
+| `adc_clk_d1/d2`  | out | 1  | ADC clock as an ODDR bit pattern (`HAS_ADC`). Board top plays it through one ODDR per ADC clock pin (ACLK, BCLK) — same pattern, same phase. |
+| `adc_capt_en`    | out | 1  | Clock enable for the board-level IOB input flops that capture the ADC buses. |
+| `adcN_data`      | in  | 12 | Captured ADC bus, `[11]` = ADC MSB. **The AD9226 module numbers its bus backwards — silk D0 is the MSB.** See AN02. |
+| `adcN_otr`       | in  | 1  | ADC over-range flag; tie 0 if unwired. |
+| `adcN_smp`       | out | 12 | Captured sample, signed, centred, sign-corrected — exported for other fabric modules. |
+| `adcN_smp_otr`   | out | 1  | Over-range, aligned with `adcN_smp`. |
+| `adc_smp_valid`  | out | 1  | One pulse per ADC sample period (every 2nd `dds_clk`), common to both ADCs. |
 
 With `NUM_CH = 1`, the channel-1 outputs are tied off and frames addressed to
-channel 1 are ignored.
+channel 1 are ignored. With `HAS_ADC = 0` the ADC ports are tied off, the
+amplitude-loop and global register blocks vanish from the map (reads return 0),
+and the core is exactly the pre-2.1 design.
+
+**Resource routing philosophy.** The DACs, ADCs and loops are deliberately not
+hard-wired to each other, because on a real bench they get mixed and matched:
+
+- *Which ADC feeds a channel's loop* is the `AGC_CTRL.SRC` register — any DDS
+  channel can watch either ADC, both channels may watch the same one.
+- *No feedback at all* is simply `AGC_CTRL.EN = 0` (the reset state): the AMP
+  register drives the datapath directly and the ADCs are ignored.
+- *An ADC needed by some other module* taps `adcN_smp` / `adc_smp_valid`; the
+  export is always live, loop or no loop.
+- *A DAC driven by another module* is a mux outside this core; the DDS cannot
+  observe that, so leave that channel's loop off.
 
 ---
 
@@ -250,9 +290,19 @@ inside a frame need no gap.
 ## 5. Register Map
 
 16-bit registers, **word-addressed** (ADDR is a word index, not a byte offset).
-The register block decodes `ADDR[5:0]` when `ADDR[13] = 0`; the waveform RAM
-occupies `ADDR[13] = 1` (0x2000–0x2FFF). Each channel has its own complete copy
-of this map, selected by CMD[14].
+When `ADDR[13] = 0`, `ADDR[12:6]` selects a register block and `ADDR[5:0]` the
+register inside it; the waveform RAM occupies `ADDR[13] = 1` (0x2000–0x2FFF).
+
+| Block | Addresses | Scope | Contents |
+|---|---|---|---|
+| 0 | 0x00–0x3F | per channel (CMD[14]) | the core registers below |
+| 1 | 0x40–0x7F | per channel (CMD[14]) | amplitude loop (§5.14), if `HAS_ADC` |
+| 2 | 0x80–0xBF | global — CMD[14] ignored | ADC front end (§5.15), if `HAS_ADC` |
+| — | 0x2000–0x2FFF | per channel | user waveform RAM |
+
+Each channel has its own complete copy of blocks 0 and 1, selected by CMD[14].
+Block 2 configures the single shared ADC capture unit; asking which channel it
+belongs to has no answer, so it answers identically under either channel bit.
 
 Reserved bits read 0 and should be written 0.
 **W1SC** = write 1, self-clearing (reads 0). **W1C** = write 1 to clear.
@@ -260,7 +310,7 @@ Reserved bits read 0 and should be written 0.
 | Addr | Name | Access | Reset | Function |
 |---|---|---|---|---|
 | 0x00 | `ID`            | RO  | 0x4453 | Identification ("DS") |
-| 0x01 | `VERSION`       | RO  | 0x0200 | Major.minor |
+| 0x01 | `VERSION`       | RO  | 0x0210 | Major.minor |
 | 0x02 | `CTRL`          | RW  | 0x0000 | Enable, waveform, mode, output format |
 | 0x03 | `STATUS`        | RO  | —      | Sweep and profile state |
 | 0x04 | `FWORD_L`       | RW  | 0x0000 | Tuning word [15:0] |
@@ -287,6 +337,24 @@ Reserved bits read 0 and should be written 0.
 | 0x1E…0x20 | `PROF1…3_POW` | RW | 0x0000 | Profiles 1–3 phase offsets |
 | 0x21 | `IRQ_EN`        | RW  | 0x0000 | Interrupt enables |
 | 0x22 | `IRQ_STAT`      | W1C | 0x0000 | Interrupt flags |
+| 0x40 | `AGC_CTRL`      | RW  | 0x0000 | Loop enable, hold, clear, source, metric |
+| 0x41 | `AGC_STATUS`    | RO  | —      | Locked / saturated / over-range |
+| 0x42 | `AGC_TARGET`    | RW  | 0x0000 | Setpoint, ADC codes |
+| 0x43 | `AGC_KI`        | RW  | 0x0600 | Integrator gain, Q8.8 (reset = 6.0) |
+| 0x44 | `AGC_TOL`       | RW  | 0x0002 | Dead band, ADC codes |
+| 0x45 | `AGC_WIN`       | RW  | 0x0010 | log2 window length in ADC samples (4–24) |
+| 0x46 | `AGC_AMP_MIN`   | RW  | 0x0000 | Integrator clamp, Q1.15 |
+| 0x47 | `AGC_AMP_MAX`   | RW  | 0x8000 | Integrator clamp, Q1.15 |
+| 0x48 | `AGC_AMP`       | RO  | —      | Amplitude actually scaling the waveform |
+| 0x49 | `AGC_VPP`       | RO  | —      | Measured peak-to-peak, ADC codes |
+| 0x4A | `AGC_RMS`       | RO  | —      | Measured AC RMS (DC removed), ADC codes |
+| 0x4B | `AGC_MEAN`      | RO  | —      | Measured DC mean, signed, sign-extended |
+| 0x4C | `AGC_VMIN`      | RO  | —      | Window minimum, signed |
+| 0x4D | `AGC_VMAX`      | RO  | —      | Window maximum, signed |
+| 0x80 | `GLOB_ID`       | RO  | 0x4147 | "AG" if `HAS_ADC`, else 0 — probe this |
+| 0x81 | `ADC_CFG`       | RW  | 0x0201 | ADC clock enable, capture phase, bus fixes |
+| 0x82 | `ADC0_RAW`      | RO  | —      | Live ADC0 sample, signed, sign-extended |
+| 0x83 | `ADC1_RAW`      | RO  | —      | Live ADC1 sample |
 | 0x2000–0x2FFF | `WAVE_RAM` | RW | — | User waveform, 4096 × 14-bit signed |
 
 ### 5.1 CTRL (0x02)
@@ -403,6 +471,74 @@ Writing the RAM while `WAVE = user` is live is allowed — the DAC simply plays
 the new samples as they land. Load the table with the channel disabled or on a
 different waveform if you need a clean switch.
 
+### 5.14 Amplitude-loop block (0x40–0x4D, per channel, `HAS_ADC` only)
+
+Unlike block 0, these are **plain registers with no shadow/commit stage** and
+they ignore `UPDATE.AUTO`. The atomic-frame machinery exists to protect values
+the datapath consumes every clock (a torn FWORD is audible); the loop reads its
+configuration once per measurement window, milliseconds apart, and every field
+fits one 16-bit write that cannot tear. `AGC_CTRL.CLR` is the one exception —
+it is a strobe deferred to the CS rising edge, so
+"clear + retarget + enable written in one frame" does what it reads like.
+
+**AGC_CTRL (0x40)**
+
+| Bit | Name | Description |
+|---|---|---|
+| 0   | `EN`     | 1 = the loop drives the amplitude; the AMP register (0x07) is overridden but keeps its value. 0 = AMP register rules. |
+| 1   | `HOLD`   | 1 = freeze the integrator but keep driving its last output. For "lock, then stop hunting" schemes. |
+| 2   | `CLR`    | W1SC. Restart the measurement window and reload the integrator from the AMP register. |
+| 5:4 | `SRC`    | 00 = ADC0, 01 = ADC1, 1x = no input (measurement parked). |
+| 8   | `METRIC` | 0 = regulate Vpp, 1 = regulate AC RMS. |
+
+**AGC_STATUS (0x41, RO)**
+
+| Bit | Name | Description |
+|---|---|---|
+| 0 | `LOCKED` | Last window's error was inside `AGC_TOL`. |
+| 1 | `SAT_HI` | Integrator railed at `AGC_AMP_MAX` — target unreachable (too high, cable off, wrong SRC…). |
+| 2 | `SAT_LO` | Railed at `AGC_AMP_MIN`. |
+| 3 | `OTR`    | The ADC flagged over-range during the last window: the input clipped, measurements are lies, and the loop is regulating a clipped copy. Reduce the signal or the chain gain. |
+
+**Semantics worth knowing**
+
+- *Bumpless both ways.* On EN 0→1 (and on CLR) the integrator loads the AMP
+  register value, so closing the loop does not step the output. While EN = 1
+  the datapath follows the loop live; the instant EN drops it is back on the
+  AMP register — which still holds whatever was last written to it.
+- *`AGC_AMP` (0x48) is the truth.* It always reads what is actually scaling
+  the waveform: the loop's value when closed, the AMP register when open.
+- *Dead band.* Inside `AGC_TOL` the integrator does not move at all. Without
+  it, the loop would dither the amplitude by one step forever around the
+  target; `LOCKED` is simply "currently inside the band".
+- *Anti-windup.* The clamps bound the integrator **state**, not just the
+  output. An unreachable target therefore parks at the rail and recovers the
+  moment the error changes sign, instead of unwinding a huge accumulated error
+  first. `AGC_AMP_MIN` also doubles as a "never fully mute" floor if the
+  downstream stage misbehaves at zero drive.
+- *The measurements are always live* (they do not need EN): `AGC_VPP` /
+  `AGC_RMS` / `AGC_MEAN` / `AGC_VMIN` / `AGC_VMAX` update once per window even
+  with the loop open, so the block doubles as a crude voltmeter. A new
+  `AGC_WIN` value takes effect at the next window boundary — write `CLR` to
+  make it now (the power-on window is 2^16 samples ≈ 1.3 ms).
+
+### 5.15 Global block (0x80–0x83, `HAS_ADC` only)
+
+**ADC_CFG (0x81)**, reset 0x0201 — the reset value is correct for the AD9226
+module wired per the reference XDC; touch it only for bring-up or odd wiring:
+
+| Bit | Name | Description |
+|---|---|---|
+| 0   | `EN`      | Run the ADC clock and capture. 0 parks the ADC clock low. |
+| 5:4 | `CLKPH`   | Forwarded-clock phase in 5 ns steps. Moves the ADC's edge without moving the capture edge — i.e. walks the capture point across the 20 ns sample period. 0 = 20 ns effective delay (nominal). See `dds_adc_if.v` for the timing derivation. |
+| 8   | `BITSWAP` | Reverse the 12-bit bus. The XDC already un-reverses the module's backwards silk screen, so this stays 0 — it exists to rescue a board wired the other way without recutting traces. |
+| 9   | `INV`     | Negate the sample. **Reset = 1** because the AD9226 module's front end inverts (D = 2048 − Vin/5 × 2048); with INV = 1 a positive volt at the SMA reads positive here. |
+
+`ADC0_RAW` / `ADC1_RAW` are live single samples (no averaging — a few codes of
+jitter is the ADC's noise floor, not a fault). They are the bring-up window
+into the analog chain: grounded input ⇒ ~0; a known DC ⇒ the volts-per-code
+constant, directly.
+
 ---
 
 ## 6. Functional Description
@@ -462,6 +598,71 @@ the DAC clock with an ODDR so data is stable at the DAC's rising edge).
 - The `sin(x)/x` roll-off of the DAC's zero-order hold is −0.9 dB at
   `0.2 × f_dds` and −3.9 dB at `0.5 × f_dds`. Compensate in the analog chain if
   you need flatness above ~20 MHz.
+
+### 6.5 ADC capture and the amplitude loop (`HAS_ADC`)
+
+```
+                 ┌────────────────────────────── dds_top ─────────────────────────┐
+ AD9226 ─ CLK <──┤ ODDR pattern (dds_clk/2, CLKPH-shiftable)   dds_adc_if         │
+ module          │                                                │               │
+        ─ D  ──> │ IOB flops (CE = capt_en, board level) ──> bitswap/centre/inv   │
+                 │                                                │               │
+                 │                     adcN_smp + adc_smp_valid ──┼──> exported   │
+                 │                                                v               │
+                 │   per channel:   dds_meas ──> vpp / rms / mean / min / max     │
+                 │   (SRC-selected)     │  once per 2^WIN samples                 │
+                 │                      v                                         │
+                 │                 dds_agc:  amp += (TARGET − meas) × KI          │
+                 │                      │    dead band, state clamps             │
+                 │                      v                                         │
+                 │              amplitude override into the s4 multiplier         │
+                 └────────────────────────────────────────────────────────────────┘
+```
+
+**Sampling.** The AD9226 tops out at 65 MSPS, so `dds_clk` (100 MHz) cannot
+clock it directly. The capture unit runs it at **`dds_clk`/2 = 50 MSPS**: the
+ADC clock leaves as an ODDR bit pattern and the returning bus is captured in
+IOB flops on a clock **enable** — every flop in the design stays on `dds_clk`,
+preserving the single-clock/zero-CDC property. The last 30 % of sample rate
+would cost an async FIFO and a set of CDC constraints; an amplitude loop that
+averages thousands of samples per update gets nothing for that price.
+
+**Measurement.** Over a window of 2^`AGC_WIN` samples, `dds_meas` tracks
+min/max (→ Vpp) and accumulates Σx and Σx² (→ mean and variance). RMS is
+computed as `sqrt(E[x²] − E[x]²)` — the **AC** RMS — because any DC in the
+chain (op-amp offset, or the DDS's own OFFSET register) would otherwise be
+folded into "amplitude" and the loop would shrink the real signal to make room
+for a DC term it cannot influence. The square root is a 12-cycle bit-serial
+unit; no divider anywhere, the window division is a shift.
+
+**The window must span ≥ 1 output period, and several is better.** The
+hardware cannot enforce this (it never sees FWORD) — it is the driver's
+contract. At 50 MSPS: `AGC_WIN = 16` ⇒ 1.31 ms, good to ~5 kHz; each −1 halves
+the window, each +1 doubles it (max 24 ⇒ 335 ms, ~10 Hz).
+
+**Vpp vs RMS.** Vpp is waveform-agnostic and matches a scope, but it is a
+two-sample statistic: above ~1 MHz out (≲ 50 samples/period) min/max reads
+systematically low and the loop pushes the true amplitude high to compensate.
+RMS averages the whole window and stays honest to the top of the band, but the
+target depends on the waveform (`Vpp = 2√2·RMS` sine, `2·RMS` square,
+`2√3·RMS` triangle). Rule of thumb: **Vpp below ~1 MHz, RMS above**.
+
+**The controller** is a pure integrator — the plant is memoryless over one
+window, so integral-only gives zero steady-state error with a single knob.
+Loop gain = `KI × k`, where the plant gain `k = M_fs / 32768` (measured
+amplitude in ADC codes at AMP = full scale, over the AMP range). On the
+reference chain (6 Vpp DA → ×0.5 → ADC at 2.441 mV/code) `M_fs ≈ 1229` Vpp
+codes ⇒ `k ≈ 1/26.7` ⇒ **unity loop gain at KI ≈ 26.7**. The reset KI = 6.0
+puts the gain near 0.22: the error decays ×0.78 per window, settling in ~20
+windows (≈ 26 ms at the default window) with no overshoot. If the loop rings,
+KI is too high for your chain; if it crawls, raise it toward a quarter of your
+measured unity value.
+
+**Amplitude resolution.** AMP is Q1.15: 32769 steps of 1/32768 (30.5 ppm of
+full scale, 183 µV at 6 Vpp). The DAC quantizes at 1/8192 of full scale
+(366 µV), so AMP is 4× finer than what the DAC can express — the loop's
+resolution limit is the DAC (and the ADC's 2.44 mV codes at the measurement
+side), never the multiplier.
 
 ---
 
@@ -567,6 +768,37 @@ The two commits are still two frames apart (a few µs at 9 MHz SCK). For a
 sample-exact simultaneous change, use PROFILE mode and tie both channels'
 `hop_sel` pins together.
 
+### 7.10 Close the amplitude loop on channel 0
+
+Reference chain: ch0's DA output reaches ADC0 at ×0.5, ADC LSB = 2.441 mV, so
+a 4 Vpp target at the DA is 2 Vpp at the ADC = 819 codes.
+
+```
+frame: 0x8004, 0x5C29, 0x028F      // 1 MHz sine, as in 7.2
+frame: 0x8002, 0x0001              // CTRL: EN
+frame: 0x8042, 0x0333              // AGC_TARGET = 819 codes (4 Vpp at the DA)
+frame: 0x8045, 0x0010              // AGC_WIN = 2^16 samples = 1.31 ms (default)
+frame: 0x8040, 0x0005              // AGC_CTRL: EN + CLR (fresh window, bumpless)
+   ... the loop settles in ~20 windows ...
+frame: 0x0041, 0x0000, 0x0000      // read AGC_STATUS -> bit0 LOCKED
+frame: 0x0048, 0x0000, 0x0000      // read AGC_AMP    -> ~0x5355
+frame: 0x0049, 0x0000, 0x0000      // read AGC_VPP    -> ~819
+```
+
+To release: `0x8040, 0x0000` — the datapath is back on the AMP register (which
+still holds its last written value) on the very next sample.
+
+Channel 1 regulating from the same ADC0 with the RMS metric instead:
+
+```
+frame: 0xC042, 0x0122              // ch1 AGC_TARGET = 290 codes RMS
+frame: 0xC040, 0x0105              // ch1 AGC_CTRL: EN + CLR + SRC=ADC0 + METRIC=RMS
+```
+
+Both loops run independently — different windows, metrics and targets, no
+arbitration, because each channel owns a complete measurement + controller
+pair.
+
 ---
 
 ## 8. Integration
@@ -575,16 +807,23 @@ sample-exact simultaneous change, use PROFILE mode and tie both channels'
 
 ```
 rtl/
-  dds_top.v         top level - instantiate this (SPI + 1..2 channels)
+  dds_top.v         top level - instantiate this (SPI + 1..2 channels + ADC)
   dds_spi_slave.v   SPI mode-0 slave, oversampled; drives the internal bus
-  dds_channel.v     one channel: registers + datapath + waveform RAM
+  dds_channel.v     one channel: registers + datapath + waveform RAM + loop
   dds_regs.v        16-bit register file, shadow/commit logic
   dds_core.v        phase accumulator, sweep engine, waveforms, output stage
   dds_sin_lut.v     quarter-wave sine ROM (inferred BRAM)
   dds_sin_lut.mem   ROM init data for $readmemh (add to the Vivado project)
   dds_wave_ram.v    user waveform dual-port RAM (inferred BRAM)
+  dds_adc_if.v      AD9226 capture: clock pattern, capture enable, bus fixes
+  dds_meas.v        per-window Vpp / AC-RMS / mean / min / max
+  dds_isqrt.v       bit-serial square root for the RMS path
+  dds_agc.v         the integrating amplitude controller
+  dds_agc_regs.v    register block 1 (0x40), per channel
+  dds_glob_regs.v   register block 2 (0x80), ADC front-end config
 tb/
   tb_dds.sv         self-checking testbench with a bit-accurate SPI master
+                    and a behavioural AD9226 + analog-chain model
 scripts/
   gen_sin_lut.py    regenerates dds_sin_lut.mem
 ```
@@ -615,19 +854,34 @@ set_false_path -from [get_ports {ch*_sweep_trig ch*_hop_sel[*]}]
 The synchronizer flops handle metastability; the protocol tolerates the
 resulting 2–3 cycle latency by design.
 
+The ADC pins (`HAS_ADC`) are **not** false paths — they are synchronous to the
+forwarded ADC clock, and the capture-phase analysis lives in `dds_adc_if.v`'s
+header. For the bring-up class of designs here, registering them in IOB flops
+(reference `board/dds_board_top.v`) and sweeping `ADC_CFG.CLKPH` over its four
+settings replaces formal input constraints; if you want the tool to check it,
+write `set_input_delay` against a generated clock on the `adc_clk` port.
+
 ### 8.4 Resource estimate (7-series, per channel)
 
 ~4 × BRAM18 (sine LUT + wave RAM), 1 × DSP48 (amplitude multiplier), roughly
-600 LUT / 900 FF. The shared SPI slave adds ~80 LUT / 120 FF. Comfortably
-exceeds 150 MHz on Artix-7 speed grade −1.
+600 LUT / 900 FF. The shared SPI slave adds ~80 LUT / 120 FF. `HAS_ADC` adds,
+per channel, 1 × DSP48 (the Σx² multiplier; the mean-square and error products
+map into the same or fabric logic) and ~350 LUT / 400 FF for the accumulators,
+square root and controller, plus ~40 LUT shared for the capture unit — no
+extra BRAM. Comfortably exceeds 150 MHz on Artix-7 speed grade −1.
 
 ### 8.5 Simulation
 
 ```
 cd tb
 iverilog -g2012 -o tb_dds.vvp tb_dds.sv ../rtl/*.v
-vvp tb_dds.vvp                    # 47 self-checks -> "ALL TESTS PASSED"
+vvp tb_dds.vvp                    # 75 self-checks -> "ALL TESTS PASSED"
 ```
+
+The testbench includes a behavioural model of the AD9226 module (inverted
+transfer function, TOD data delay) fed by a model of the reference analog
+chain (DA → ×0.5 → ADC0, → ×0.25 → ADC1), so the closed-loop tests exercise
+convergence, lock, saturation, source switching and the RMS metric end to end.
 
 Add `-DSCK_FAST` to rerun the whole suite with SCK at the documented
 `dds_clk / 6` limit (16 MHz). A `tb_dds.vcd` waveform dump is produced.
@@ -652,6 +906,16 @@ Add `-DSCK_FAST` to rerun the whole suite with SCK at the documented
   FWORD). For a phase-exact I/Q pair, either null the offset once with POW at
   your operating frequency, or add a sync signal in your wrapper that releases
   both channels' `dds_rstn` — or both `CTRL.EN`s — on one edge. See AN01 §9.
+- **The amplitude loop trusts its window.** It cannot know the output
+  frequency, so a window shorter than one output period measures a slice of
+  the waveform and the loop chases the slice — set `AGC_WIN` per §6.5.
+- The loop regulates whatever the selected ADC sees. Sweeps and FSK hops move
+  the frequency through the analog chain's frequency response, and the loop
+  will "correct" that response into the drive amplitude at its window rate —
+  usually what you want for levelling, occasionally a surprise. `HOLD` freezes
+  the integrator when it is not.
+- Vpp measurement degrades above roughly `f_sample / 50` (≈ 1 MHz at 50 MSPS);
+  switch the metric to RMS there (§6.5).
 
 ---
 
@@ -659,5 +923,6 @@ Add `-DSCK_FAST` to rerun the whole suite with SCK at the documented
 
 | Version | Change |
 |---|---|
+| 0x0210 | Optional ADC feedback (`HAS_ADC`): dual AD9226 capture at `dds_clk`/2 (single-clock, ODDR pattern + capture enable), per-channel Vpp/AC-RMS/mean/min/max measurement, per-channel integrating amplitude loop with dead band, anti-windup and lock/saturation status, amplitude override into the datapath (AMP register semantics unchanged), register blocks 1 (0x40, per channel) and 2 (0x80, global), captured-stream export. |
 | 0x0200 | SPI (mode 0, 16-bit) replaces APB. 16-bit register map, dual channel on one chip select, single clock domain, atomic frame commit, AMP moved to Q1.15, SWEEP_RATE widened to 32 bits. |
 | 0x0110 | APB version: 32-bit registers, DC offset, dual-clock CDC. |

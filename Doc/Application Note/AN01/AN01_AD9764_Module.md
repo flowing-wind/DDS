@@ -218,7 +218,7 @@ For a phase-locked I/Q pair you therefore have two honest options:
 2. Jumpers J3/J5 fitted (internal reference) for first light.
 3. `dds_clk` = 100 MHz (the core's only clock), ODDR-inverted clock to CLKA.
 4. Check the SPI link first: `id` on the STM32 console must print
-   `ID 0x4453 VERSION 0x0200` for both channels. If not, stop here — the DAC
+   `ID 0x4453 VERSION 0x0210` for both channels. If not, stop here — the DAC
    cannot be right if the register bus is not.
 5. `freq 1M`, `wave sine`, `fmt ob`, `on` (or write FWORD = 0x028F5C29 and
    CTRL = 0x0001 directly: EN, sine, 14-bit, offset binary).

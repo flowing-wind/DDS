@@ -88,7 +88,7 @@ module dds_regs (
 );
 
 localparam [15:0] ID_CODE = 16'h4453;   // "DS"
-localparam [15:0] VERSION = 16'h0200;   // v2.0 - SPI
+localparam [15:0] VERSION = 16'h0210;   // v2.1 - SPI + ADC feedback / AGC
 
 localparam A_ID        = 6'h00, A_VER       = 6'h01, A_CTRL      = 6'h02,
            A_STATUS    = 6'h03, A_FWORD_L   = 6'h04, A_FWORD_H   = 6'h05,

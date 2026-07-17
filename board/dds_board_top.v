@@ -42,6 +42,19 @@ module dds_board_top #(
     output wire [13:0] dac1_data,      // -> DB13..DB0
     output wire        dac1_clk,       // -> CLKB
 
+    // AD9226 module, both channels. BEWARE THE SILK SCREEN: the module numbers
+    // its bus backwards, header silk D0 is the ADC's MSB. The XDC does the
+    // un-reversing, so adc0_data[11] here = silk D0 = MSB. See AN02.
+    // ACLK and BCLK are separate header pins, so each gets its own output
+    // port and its own ODDR - both play the same dds_clk/2 pattern, so the
+    // two ADCs sample on the same edge.
+    output wire        adc0_clk,       // -> ACLK, 50 MHz
+    output wire        adc1_clk,       // -> BCLK, 50 MHz
+    input  wire [11:0] adc0_data,      // <- AD1 channel
+    input  wire        adc0_otr,       // <- ATR (over-range; optional, tie 0)
+    input  wire [11:0] adc1_data,      // <- AD2 channel
+    input  wire        adc1_otr,       // <- BTR
+
     // optional: one LED per channel, lit while that channel's interrupt is set
     output wire [1:0]  led
 );
@@ -79,10 +92,14 @@ wire dds_rstn = rst_sync[1];
 // --------------------------------------------------------------- the DDS IP
 wire [13:0] ch0_dac_data, ch1_dac_data;
 wire [1:0]  dds_irq;
+wire        adc_clk_d1, adc_clk_d2, adc_capt_en;
+wire [11:0] adc0_data_r, adc1_data_r;
+wire        adc0_otr_r,  adc1_otr_r;
 
 dds_top #(
     .NUM_CH         (2),
-    .SIN_LUT_FILE   ("dds_sin_lut.mem")
+    .SIN_LUT_FILE   ("dds_sin_lut.mem"),
+    .HAS_ADC        (1)
 ) u_dds (
     .dds_clk        (dds_clk),
     .dds_rstn       (dds_rstn),
@@ -104,6 +121,21 @@ dds_top #(
     .ch0_dac_valid  (),
     .ch1_dac_data   (ch1_dac_data),
     .ch1_dac_valid  (),
+
+    .adc_clk_d1     (adc_clk_d1),
+    .adc_clk_d2     (adc_clk_d2),
+    .adc_capt_en    (adc_capt_en),
+    .adc0_data      (adc0_data_r),
+    .adc0_otr       (adc0_otr_r),
+    .adc1_data      (adc1_data_r),
+    .adc1_otr       (adc1_otr_r),
+
+    // the captured streams are also available here for other fabric modules
+    .adc0_smp       (),
+    .adc0_smp_otr   (),
+    .adc1_smp       (),
+    .adc1_smp_otr   (),
+    .adc_smp_valid  (),
 
     .dds_irq        (dds_irq)
 );
@@ -161,5 +193,65 @@ ODDR #(
     .R  (1'b0),
     .S  (1'b0)
 );
+
+// -------------------------------------------------------- ADC clock and data
+// The AD9226s run at 50 MSPS from a clock synthesized as an ODDR bit pattern:
+// dds_adc_if computes which half-cycles are high (that is how its CLKPH phase
+// knob works) and these ODDRs merely play the pattern out. Same reasoning as
+// the DAC clocks - a clock must leave the fabric through a clock-capable
+// output path, not ordinary routing. ACLK and BCLK are separate pins on the
+// module, so each gets its own ODDR; both are fed the same D1/D2 pattern and
+// launch from the same dds_clk edge, which is what keeps the two ADCs
+// sampling in lockstep (and lets one CLKPH setting time both).
+ODDR #(
+    .DDR_CLK_EDGE ("SAME_EDGE"),
+    .INIT         (1'b0),
+    .SRTYPE       ("SYNC")
+) u_oddr_adc0 (
+    .Q  (adc0_clk),
+    .C  (dds_clk),
+    .CE (1'b1),
+    .D1 (adc_clk_d1),
+    .D2 (adc_clk_d2),
+    .R  (1'b0),
+    .S  (1'b0)
+);
+
+ODDR #(
+    .DDR_CLK_EDGE ("SAME_EDGE"),
+    .INIT         (1'b0),
+    .SRTYPE       ("SYNC")
+) u_oddr_adc1 (
+    .Q  (adc1_clk),
+    .C  (dds_clk),
+    .CE (1'b1),
+    .D1 (adc_clk_d1),
+    .D2 (adc_clk_d2),
+    .R  (1'b0),
+    .S  (1'b0)
+);
+
+// Returning ADC data lands in IOB flops, same argument as the DAC outputs but
+// in reverse: capturing at the pad gives every bit an identical, minimal input
+// delay, so the 12 bits cannot skew apart in fabric routing. The clock enable
+// makes them sample once per ADC period, on the edge dds_adc_if picked to sit
+// mid-window (its header derives the margins).
+(* IOB = "TRUE" *) reg [11:0] adc0_capt;
+(* IOB = "TRUE" *) reg [11:0] adc1_capt;
+(* IOB = "TRUE" *) reg        adc0_otr_capt, adc1_otr_capt;
+
+always @(posedge dds_clk) begin
+    if (adc_capt_en) begin
+        adc0_capt     <= adc0_data;
+        adc1_capt     <= adc1_data;
+        adc0_otr_capt <= adc0_otr;
+        adc1_otr_capt <= adc1_otr;
+    end
+end
+
+assign adc0_data_r = adc0_capt;
+assign adc1_data_r = adc1_capt;
+assign adc0_otr_r  = adc0_otr_capt;
+assign adc1_otr_r  = adc1_otr_capt;
 
 endmodule // dds_board_top
